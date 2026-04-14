@@ -1,164 +1,99 @@
 # Custom ChainSpec Guide
 
-This guide explains the practical ways to create a custom chainspec in Reth and wire it into a
-node via CLI and/or `NodeConfig`.
+Use this when you need a non-default chain schedule, custom genesis, or new hardfork markers.
 
-The examples in this repo demonstrate two common patterns:
+## Fast decision tree
 
-- Provide a custom genesis JSON (optionally including extra fields) and let Reth parse it.
-- Build a `ChainSpec` (or wrapper) programmatically and inject it into `NodeConfig`.
+### Only change activation points for existing Ethereum forks
 
-## 1) Choose how you want to define your chain
+Use `ChainSpecBuilder` in `crates/chainspec/src/spec.rs`.
 
-### Option A: Genesis JSON file (recommended for most custom networks)
+Typical flow:
 
-The default `reth` CLI treats the `--chain` argument as either:
+1. start from `ChainSpecBuilder::mainnet()` or `ChainSpec::builder()`
+2. set `chain(...)` and `genesis(...)` if needed
+3. add, remove, or move forks with `with_fork(...)`, `without_fork(...)`, `with_prague_at(...)`, `with_osaka_at(...)`, or `paris_at_ttd(...)`
+4. call `build()`
 
-- a built-in chain name (`mainnet`, `sepolia`, `holesky`, `hoodi`, `dev`), or
-- a path to a genesis JSON file, or
-- an inline JSON string that deserializes to `alloy_genesis::Genesis`.
+This is the shortest path for local devnets, tests, or Ethereum-like chains.
 
-Parsing behavior is implemented in `reth_cli::chainspec::parse_genesis`.
+### Start from a genesis file only
 
-Code pointers:
+Use `ChainSpec::from_genesis` / `impl From<Genesis> for ChainSpec` in `crates/chainspec/src/spec.rs`.
 
-- Parser trait: `crates/cli/cli/src/chainspec.rs`
-- Default Ethereum parser: `crates/ethereum/cli/src/chainspec.rs`
+This works when the fork schedule fits standard Ethereum genesis fields such as:
 
-Usage:
+- block-based fork numbers
+- timestamp-based fork times
+- merge TTD fields
+- blob schedule fields
+- deposit contract address
 
-```bash
-# Use a built-in spec
-reth node --chain sepolia
+### Need brand-new hardfork names or extra config
 
-# Use a custom genesis file
-reth node --chain /path/to/genesis.json
+Follow `examples/custom-hardforks/src/chainspec.rs`.
 
-# Initialize a DB explicitly from your genesis
-reth init --chain /path/to/genesis.json
-```
+That example does four things:
 
-When you pass a genesis file, the CLI deserializes it into `Genesis` and then converts it into a
-`ChainSpec` via `impl From<Genesis> for ChainSpec`.
+1. defines a custom hardfork enum with `hardfork!`
+2. reads extra fork config from `genesis.config.extra_fields`
+3. inserts those forks into an inner `ChainSpec`
+4. exposes the wrapper through `Hardforks`, `EthChainSpec`, and `EthereumHardforks`
 
-### Option B: Programmatic `ChainSpecBuilder`
+Use this path when downstream code needs to query your new fork names directly.
 
-If you embed Reth as a library (custom binary / integration tests), you can build a `ChainSpec`
-directly.
+## Practical patterns
 
-`reth_chainspec::ChainSpecBuilder` supports:
+### Pattern 1: tweak an existing Ethereum schedule
 
-- setting `chain(Chain)` and `genesis(Genesis)`,
-- `with_fork(fork, ForkCondition)` and `with_forks(ChainHardforks)`.
+Best when you only need a different activation timeline.
 
-Code: `crates/chainspec/src/spec.rs`
+Touch:
 
-## 2) Configure hardfork scheduling
+- `crates/chainspec/src/spec.rs` builder API
+- your node/bootstrap code that injects the spec
 
-Fork activation is expressed as `ForkCondition`:
+Keep the concrete type as `ChainSpec`.
 
-- `ForkCondition::Block(n)`
-- `ForkCondition::Timestamp(t)`
-- `ForkCondition::TTD { ... }`
-- `ForkCondition::Never`
+### Pattern 2: custom genesis + standard Ethereum forks
 
-If you only need the standard Ethereum forks, the easiest path is to encode the fork blocks/times
-in the genesis `config` fields and let `From<Genesis> for ChainSpec` populate the fork schedule.
+Best when the chain has its own genesis state but still uses Ethereum fork names.
 
-If you want custom forks (non-Ethereum), you must define your own fork enum and insert it into the
-fork list.
+Touch:
 
-Example pattern:
+- genesis JSON
+- `ChainSpec::from_genesis` call site or builder setup
 
-- Define a custom fork enum with `hardfork!(...)`.
-- Wrap `ChainSpec` and delegate the `Hardforks`/`EthChainSpec` methods to the inner spec.
-- Insert custom forks into `inner.hardforks`.
+Avoid a wrapper type unless you need extra behavior beyond the standard trait surface.
 
-See: `examples/custom-hardforks/src/chainspec.rs`
+### Pattern 3: custom forks layered on top of Ethereum forks
 
-## 3) Wire a custom chainspec into node startup
+Best when the chain adds chain-specific upgrades.
 
-### A) CLI wiring (most common)
+Touch:
 
-If you are using the stock `reth` binary, you typically only need `--chain`.
+- `examples/custom-hardforks/src/chainspec.rs` pattern
+- custom enum from `hardfork!`
+- custom config struct deserialized from `extra_fields`
+- wrapper impls for `Hardforks`, `EthChainSpec`, `EthereumHardforks`
 
-- Built-in names map to built-in `Arc<ChainSpec>` values.
-- Otherwise, the argument is interpreted as a genesis file path (or inline JSON).
+## Gotchas
 
-Code: `crates/ethereum/cli/src/chainspec.rs`
+- `fork_id` and `fork_filter` affect networking compatibility, not just execution behavior. If the schedule is wrong, peer filtering is wrong too.
+- Merge / Paris handling is special. External genesis files may not provide enough data to infer the merge activation block cleanly.
+- `fork_filter` ignores TTD forks without a known `fork_block`.
+- `make_genesis_header` derives genesis header fields from the active forks. If you move London, Shanghai, Cancun, or Prague to genesis, the genesis header changes accordingly.
+- If a subsystem only needs chain behavior, prefer accepting `EthChainSpec` instead of the concrete `ChainSpec` type.
 
-### B) Programmatic wiring via `NodeConfig`
+## Minimal retrieval map
 
-`NodeConfig` stores the chain spec as `pub chain: Arc<ChainSpec>`.
+- concrete spec: `crates/chainspec/src/spec.rs`
+- trait boundary: `crates/chainspec/src/api.rs`
+- hardfork re-exports: `crates/ethereum/hardforks/src/lib.rs`
+- custom-fork example: `examples/custom-hardforks/src/chainspec.rs`
 
-- Default `NodeConfig<ChainSpec>` uses `MAINNET`.
-- You can replace it with `with_chain(...)`.
+## Read next
 
-Code: `crates/node/core/src/node_config.rs`
-
-Sketch:
-
-```rust,ignore
-use std::sync::Arc;
-use reth_chainspec::{ChainSpec, ChainSpecBuilder, Chain};
-use reth_node_core::node_config::NodeConfig;
-
-// Build a custom spec programmatically.
-let spec = ChainSpecBuilder::default()
-    .chain(Chain::dev())
-    .genesis(Default::default())
-    // add/override fork schedule here
-    .build();
-
-let config = NodeConfig::new(Arc::new(spec));
-```
-
-If your chain spec type is not the vanilla `reth_chainspec::ChainSpec` (for example, you have a
-wrapper type that implements the relevant traits), use `map_chainspec` to transform the stored
-spec.
-
-Code: `crates/node/core/src/node_config.rs`
-
-### C) Custom CLI wiring via a custom `ChainSpecParser`
-
-If you build a custom binary and want `--chain <name>` to understand additional identifiers, you
-can implement `reth_cli::chainspec::ChainSpecParser` for your own parser type.
-
-The parser contract:
-
-- `const SUPPORTED_CHAINS: &'static [&'static str]`
-- `fn parse(s: &str) -> eyre::Result<Arc<Self::ChainSpec>>`
-
-Then parameterize the CLI entrypoint with your parser, similar to how the stock binary uses
-`EthereumChainSpecParser`.
-
-Code pointers:
-
-- Trait: `crates/cli/cli/src/chainspec.rs`
-- Default parser: `crates/ethereum/cli/src/chainspec.rs`
-
-## 4) Validate the network identity you created
-
-A mismatched chainspec will prevent P2P connectivity because peers validate fork ids.
-
-Quick checks to perform:
-
-- Confirm `chain_id` and `genesis_hash` are what you expect.
-- Confirm fork schedule ordering/activation points.
-- Confirm the computed fork id at genesis/head matches what you intend to advertise.
-
-Useful APIs:
-
-- `ChainSpec::genesis_hash()`
-- `ChainSpec::fork_id(&Head)`
-- `ChainSpec::latest_fork_id()`
-- `ChainSpec::fork_filter(head)`
-
-Code: `crates/chainspec/src/spec.rs`
-
-## 5) Relevant in-repo examples
-
-- `examples/custom-hardforks/src/chainspec.rs`: adding custom forks and delegating traits.
-- `examples/custom-node/src/chainspec.rs`: wrapping an existing chainspec type and delegating fork
-  logic.
-- `crates/ethereum/cli/src/chainspec.rs`: how the stock binary resolves `--chain`.
+- `agent-docs/architecture/chainspec-and-hardforks.md`
+- `examples/custom-hardforks/src/chainspec.rs`
+- `crates/chainspec/src/spec.rs`

@@ -1,286 +1,142 @@
 # Txpool Integration Guide
 
-This guide explains how to integrate and customize Reth's transaction pool (`reth_transaction_pool`) as a consumer (network/RPC/block production) or as a node integrator (custom validation, policies, and failure handling).
+## Goal
 
-## Who This Is For
+Use this guide when tracing transaction intake into the mempool, debugging why a transaction did not reach block building, or replacing default pool or payload-builder components.
 
-- Node integrators building a custom node with `reth-node-builder`
-- Developers adding custom transaction validation or mempool policies
-- Engineers debugging why txpool rejects transactions (underpriced, spam limits, etc.)
+High-signal files:
 
-## Quick Map
+- pool trait: `crates/transaction-pool/src/traits.rs:111`
+- Ethereum validator: `crates/transaction-pool/src/validate/eth.rs:79`
+- maintenance loop: `crates/transaction-pool/src/maintain.rs:98`
+- node pool builder: `crates/node/builder/src/components/pool.rs:164`
+- payload service builder: `crates/node/builder/src/components/payload.rs:86`
+- Ethereum payload builder: `crates/ethereum/payload/src/lib.rs:142`
 
-- Pool API surface: `crates/transaction-pool/src/traits.rs` (`TransactionPool`, `TransactionPoolExt`)
-- Pool type: `crates/transaction-pool/src/lib.rs` (`Pool<V, T, S>`, `Pool::eth_pool(...)`)
-- Validator abstraction: `crates/transaction-pool/src/validate/mod.rs` (`TransactionValidator`)
-- Ethereum validator implementation: `crates/transaction-pool/src/validate/eth.rs`
-- P2P tx integration: `crates/net/network/src/transactions/mod.rs` (`TransactionsManager`)
-- RPC `txpool_` endpoints: `crates/rpc/rpc/src/txpool.rs`
+## Trace local submission
 
-## End-to-End Data Flow
+Follow this path for RPC-submitted transactions:
 
-### 1) From RPC to pool
+1. RPC decodes the transaction and submits it through `TransactionPool::add_transaction`: `crates/transaction-pool/src/traits.rs:111`
+2. The configured validator performs stateless and stateful checks: `crates/transaction-pool/src/validate/eth.rs:79`
+3. The pool stores the transaction and emits listeners if insertion succeeds: `crates/transaction-pool/src/lib.rs:347`
+4. When the transaction becomes executable, the pool can surface it through pending listeners or `best_transactions_with_attributes`: `crates/transaction-pool/src/traits.rs:404`
 
-1. `eth_sendRawTransaction` decodes bytes and recovers sender (outside txpool crate).
-2. RPC submits to pool:
+What to check first:
 
-- `pool.add_transaction(TransactionOrigin::Local, tx)`
+- fee floor and replacement bump settings: `crates/node/core/src/args/txpool.rs:334`, `crates/node/core/src/args/txpool.rs:356`
+- size or gas caps: `crates/node/core/src/args/txpool.rs:360`, `crates/node/core/src/args/txpool.rs:352`
+- local/private propagation policy: `crates/transaction-pool/src/lib.rs:43`, `crates/node/core/src/args/txpool.rs:369`
 
-3. Pool calls its configured validator:
+## Trace network submission
 
-- `TransactionValidator::validate_transaction(Local, tx)`
+Follow this path for peer-originated transactions:
 
-4. If valid, pool stores the tx and emits events.
+1. The networking layer receives announcements or pooled transactions: `crates/net/network/src/transactions/mod.rs:284`
+2. Unknown transactions are imported through the pool as external origin: the external import entrypoints are part of `TransactionPool`: `crates/transaction-pool/src/traits.rs:111`
+3. The pool exposes hashes and pooled elements back to networking, including blob sidecars when required: `crates/transaction-pool/src/traits.rs:258`, `crates/transaction-pool/src/traits.rs:389`
 
-### 2) From P2P to pool
+If blob transactions are missing on peer responses, inspect:
 
-The network has a dedicated `TransactionsManager` that handles tx gossip and fetching.
+- blob support flags and cache sizing: `crates/node/core/src/args/txpool.rs:326`, `crates/node/core/src/args/txpool.rs:364`
+- blob-store creation in node builder: `crates/node/builder/src/components/pool.rs:209`
 
-1. Peer sends either:
+## Trace block-building selection
 
-- `Transactions` (full tx objects) or
-- `NewPooledTransactionHashes` (hash announcement)
+Follow this path when a transaction is in the pool but not appearing in built payloads:
 
-2. `TransactionsManager` filters known/invalid and converts pooled tx bytes to a pool tx type.
-3. It submits to pool:
+1. The payload service is spawned with the already-built transaction pool: `crates/node/builder/src/components/payload.rs:86`
+2. The engine path requests a new payload job through the payload service handle: `crates/payload/builder/src/service.rs:108`
+3. The default Ethereum payload builder asks the pool for `best_transactions_with_attributes`: `crates/ethereum/payload/src/lib.rs:99`, `crates/ethereum/payload/src/lib.rs:133`
+4. The iterator filters by current base fee and blob fee before yielding candidates: `crates/transaction-pool/src/pool/best.rs:27`
+5. The builder stops or skips transactions when gas, blob-count, or block-size limits are exceeded: `crates/ethereum/payload/src/lib.rs:142`
 
-- `pool.add_external_transactions(txs)` (uses `TransactionOrigin::External`)
+Typical reasons a transaction is skipped even after entering the pool:
 
-4. Pool validates and inserts.
-5. When a tx becomes pending, the manager learns about it via:
+- it is not in the pending subpool yet
+- its max fee no longer satisfies current base fee or blob fee
+- it exceeds block gas or blob-count constraints for the current build
+- an earlier transaction from the same sender failed and invalidated descendants for this build iterator
 
-- `pool.pending_transactions_listener()`
+## Trace canonical-state updates and reorgs
 
-and then gossips it out.
+Use this path when the pool looks stale after new blocks or reorgs:
 
-### 3) From pool to P2P
+1. The node spawns pool maintenance together with the pool: `crates/node/builder/src/components/pool.rs:164`
+2. `maintain_transaction_pool_future` consumes canonical-state notifications: `crates/transaction-pool/src/maintain.rs:98`
+3. The pool applies `on_canonical_state_change`, updates fee context, removes mined transactions, and keeps blob sidecars until finality: `crates/transaction-pool/src/traits.rs:729`
 
-When txs become pending, the txpool emits hashes to the network via the pending listener.
+What to verify:
 
-The network then:
+- the canonical-state stream is alive
+- `BlockInfo` is moving forward
+- finalized blob cleanup is not happening too early
 
-- broadcasts full transactions to a subset of peers
-- broadcasts hashes to the rest
+## Common customization points
 
-Blob txs (EIP-4844) are only ever announced as hashes and must be requested via `GetPooledTransactions`.
+### Add custom validation
 
-When peers request txs:
+Wrap or replace the default validator when you need chain-specific or policy-specific checks.
 
-- `TransactionsManager` answers `GetPooledTransactions` via
-  - `pool.get_pooled_transaction_elements(hashes, limit)`
+Start here:
 
-This returns the *pooled* representation (including blob sidecars, fetched from blobstore).
+- validator type: `crates/transaction-pool/src/validate/eth.rs:79`
+- builder entrypoint: `crates/node/builder/src/components/pool.rs:109`
 
-### 4) From pool to RPC
+Use this for:
 
-The RPC `txpool_` namespace is *read-only inspection*.
+- allowlists or denylists
+- local-only transaction retention
+- tighter calldata or gas heuristics
+- custom chain transaction types
 
-- `txpool_content` / `txpool_inspect` / `txpool_status` call `pool.all_transactions()` and convert txs to RPC responses.
+### Change pool sizing or policy
 
-Separately, `eth_` provides pending tx streaming for filters/pubsub:
+Adjust CLI-backed pool settings in `crates/node/core/src/args/txpool.rs:292`.
 
-- `eth_newPendingTransactionFilter` uses:
-  - hashes: `pool.pending_transactions_listener()`
-  - full txs: `pool.new_pending_pool_transactions_listener()`
-- `eth_subscribe("newPendingTransactions")` uses the same sources.
+Highest-impact knobs:
 
-## Where Validation Happens
+- subpool size/count limits
+- `max_account_slots`
+- `price_bump` and `blob_transaction_price_bump`
+- `minimum_priority_fee`
+- `max_tx_input_bytes`
+- local exemptions and propagation flags
 
-Validation happens *before insertion* into the internal pool structure.
+### Replace payload building behavior
 
-- `Pool` (the `TransactionPool` implementation) calls `validator.validate_transaction(...)`.
-- The validator returns a `TransactionValidationOutcome`:
-  - `Valid { ... }` => inserted
-  - `Invalid(tx, err)` => rejected
-  - `Error(hash, err)` => rejected
+Swap the default payload-service or payload-builder implementation if you need custom block selection logic.
 
-Blob sidecars are handled during validation:
+Start here:
 
-- If the tx is a new blob transaction, the validator returns `ValidWithSidecar { transaction, sidecar }`.
-- The pool stores tx data in the mempool and writes the sidecar to its blobstore after releasing the pool write lock.
+- payload service builder trait: `crates/node/builder/src/components/payload.rs:14`
+- default basic service builder: `crates/node/builder/src/components/payload.rs:69`
+- default job generator: `crates/payload/basic/src/lib.rs:55`
+- example override: `examples/custom-payload-builder/src/main.rs:56`
 
-### Propagation control
+Use this for:
 
-Validation also determines whether the tx should be gossiped:
+- alternative transaction selection heuristics
+- custom payload deadlines or cadence
+- non-Ethereum payload types
+- extra instrumentation around build jobs
 
-- The validator sets `propagate: bool` in the `Valid` outcome.
+## Debug checklist
 
-If `propagate == false`, the tx can still be stored and available for local use, but networking and other `PropagateOnly` listeners will not emit it.
+When a transaction is missing from `txpool_*` or from built blocks, check in this order:
 
-## Common Failure Modes (and where to look)
+1. Did validation reject it? Inspect validator rules and fee settings.
+2. Did it enter a non-pending subpool? Inspect pending vs queued views.
+3. Did canonical-state maintenance fall behind after a restart or reorg?
+4. Did current base fee or blob fee make it temporarily unselectable for block building?
+5. Did payload-builder gas, blob-count, or time limits cut it from the current job?
 
-### Underpriced
+## Useful retrieval paths
 
-Symptoms:
-
-- local RPC submission rejected as `Underpriced`
-- replacement tx rejected as `ReplacementUnderpriced`
-
-Where it comes from:
-
-- `InvalidPoolTransactionError::Underpriced`
-- `PoolErrorKind::ReplacementUnderpriced`
-
-What to check:
-
-- `PoolConfig.minimum_priority_fee` (rejects low-tip txs)
-- protocol min base fee enforcement (`minimal_protocol_basefee`)
-- replacement bump logic (`PriceBumpConfig`):
-  - default bump is 10%
-  - blob tx replacement bump is 100%
-
-### Spam limits / sender capacity
-
-Symptoms:
-
-- `PoolErrorKind::SpammerExceededCapacity(address)`
-
-Meaning:
-
-- a sender exceeded the per-account slot limit enforced by the pool.
-
-What to check:
-
-- `PoolConfig.max_account_slots` (default 16)
-- local exemption configuration (if you expect certain addresses to be exempt):
-  - `LocalTransactionConfig.local_addresses`
-  - `LocalTransactionConfig.no_exemptions`
-
-### Immediate eviction on insert
-
-Symptoms:
-
-- insert returns `PoolErrorKind::DiscardedOnInsert`
-
-Meaning:
-
-- tx was valid, inserted, but immediately discarded to satisfy pool-wide size/txcount limits.
-
-What to check:
-
-- subpool limits:
-  - `pending_limit`, `queued_limit`, `basefee_limit`, `blob_limit`
-- expected transaction sizes (`encoded_length`) and whether your limits are too small for bursts
-
-### Oversized transaction data
-
-Symptoms:
-
-- `InvalidPoolTransactionError::OversizedData { size, limit }`
-
-What to check:
-
-- tx input size
-- configured `max_tx_input_bytes`
-
-### Gas limit issues
-
-Symptoms:
-
-- `InvalidPoolTransactionError::ExceedsGasLimit(tx_gas, block_gas_limit)`
-- `InvalidPoolTransactionError::MaxTxGasLimitExceeded(tx_gas, max_allowed)`
-
-What to check:
-
-- `PoolConfig.gas_limit` (enforced block gas limit for pool acceptance)
-- `max_tx_gas_limit` if configured
-
-### Blob transaction issues
-
-Symptoms:
-
-- missing sidecar, invalid KZG proofs, too many blobs, etc.
-
-Relevant errors:
-
-- `Eip4844PoolTransactionError::*`
-
-What to check:
-
-- that blob support is enabled in node config
-- that the network isn't sending blob txs in full broadcasts (disallowed by EIP-4844)
-- blobstore health/capacity (disk-based blob store is used by default in node builder)
-
-## How to Add Custom Validation
-
-### Option A: Wrap an existing validator
-
-Most integrations want to keep the default Ethereum validation but add a local policy layer.
-
-Approach:
-
-- implement `TransactionValidator` for a wrapper type
-- delegate to the inner validator
-- post-process `TransactionValidationOutcome`
-
-What you can do in the wrapper:
-
-- reject transactions based on:
-  - allow/deny lists
-  - extra size or calldata heuristics
-  - per-sender rate limits
-  - custom chain-specific rules
-- set `propagate = false` for transactions you want to keep locally
-
-When choosing how to fail:
-
-- Use `TransactionValidationOutcome::Invalid(tx, err)` if the tx should never be accepted.
-- Use `TransactionValidationOutcome::Error(hash, err)` for transient internal failures (DB unavailable, upstream provider issues).
-
-### Option B: Add a custom `PoolTransactionError`
-
-If you want custom invalid reasons (and control whether they count as "bad" for peer reputation):
-
-- define your error type implementing `PoolTransactionError`
-  - implement `is_bad_transaction()` according to whether peers should be penalized
-- return it as:
-  - `InvalidPoolTransactionError::Other(Box<dyn PoolTransactionError>)`
-
-This plugs into:
-
-- `PoolError::is_bad_transaction()`
-- `TransactionsManager` peer penalization decisions
-
-### Option C: Configure policy instead of code
-
-Before adding custom code, check if configuration already solves it:
-
-- `minimum_priority_fee` to reduce low-tip spam
-- `max_account_slots` to limit per-sender spam
-- subpool size limits to control memory
-- `no_local_transactions_propagation` / local address list to adjust local vs network behavior
-
-## Wiring It Into a Node
-
-Node builder sets up the pool and maintenance tasks.
-
-- `crates/node/builder/src/components/pool.rs` shows the patterns:
-  - create blobstore (`DiskFileBlobStore`)
-  - build a pool with a `TransactionValidationTaskExecutor`-wrapped validator
-  - spawn maintenance:
-    - `maintain_transaction_pool_future(...)`
-    - optional local tx backup task
-
-If you build a custom pool/validator:
-
-- ensure the pool type implements `TransactionPool` (and `TransactionPoolExt` if you want standard maintenance)
-- ensure your `PoolTransaction` type supports pooled/consensus conversions expected by networking
-
-## Debugging Tips
-
-- If a tx isn't being propagated:
-  - check validator returned `propagate = false`
-  - check listeners are `PropagateOnly`
-  - check `no_local_transactions_propagation` config
-- If P2P isn't accepting txs:
-  - confirm node isn't `is_initially_syncing()` (tx gossip is ignored while syncing)
-  - inspect whether the error is considered "bad" and peer is being penalized
-- If `txpool_content` looks empty but you expect transactions:
-  - it only shows pending/queued (as classified by the pool)
-  - basefee/blob parked txs may not appear depending on interpretation; in Reth it reports pending vs queued via `all_transactions()`
-
-## Related Docs
-
-- `llmdocs/architecture/transaction-pool.md` (architecture + abstractions)
-- JSON-RPC overview: `llmdocs/architecture/json-rpc-stack.md`
-- Adding RPC endpoints: `llmdocs/guides/adding-or-modifying-rpc.md`
+- `crates/transaction-pool/src/traits.rs:111`
+- `crates/transaction-pool/src/validate/eth.rs:79`
+- `crates/transaction-pool/src/maintain.rs:98`
+- `crates/transaction-pool/src/pool/best.rs:27`
+- `crates/node/builder/src/components/pool.rs:164`
+- `crates/node/builder/src/components/payload.rs:86`
+- `crates/ethereum/payload/src/lib.rs:142`

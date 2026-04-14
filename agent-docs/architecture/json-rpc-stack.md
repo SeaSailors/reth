@@ -1,227 +1,161 @@
 # JSON-RPC Stack
 
-This document describes how Reth builds and serves its JSON-RPC APIs end-to-end: from `jsonrpsee`-generated traits, through concrete handler implementations, into `RpcModuleBuilder`/`TransportRpcModules`, and finally into `RpcServerConfig` / `AuthServerConfig` that start HTTP/WS/IPC servers.
+## Purpose
 
-## Layering Overview
+Reth splits RPC into four layers:
 
-Reth intentionally splits the JSON-RPC stack into clear layers:
+1. interface traits in `crates/rpc/rpc-api/`
+2. handler implementations in `crates/rpc/rpc/` and `crates/rpc/rpc-engine-api/`
+3. module assembly in `crates/rpc/rpc-builder/`
+4. node wiring and hooks in `crates/node/builder/src/rpc.rs`
 
-1. `rpc-api` (interfaces): `jsonrpsee` `#[rpc]` traits that define namespaces and method names.
-2. RPC implementations: concrete types that implement the generated `*ApiServer` traits.
-3. Module assembly: `RpcModuleBuilder` builds `RpcModule`s and `TransportRpcModules` based on transport/module selection.
-4. Server startup: `RpcServerConfig` starts HTTP/WS/IPC servers with the chosen modules.
-5. Auth (Engine API) server startup: `AuthServerConfig` starts the authenticated Engine API server (JWT-protected).
+This keeps method definitions, business logic, transport selection, and server startup separate.
 
-A useful mental model is:
+## Main crates
 
-```
-(jsonrpsee traits) -> (handler structs implement traits) -> (RpcModule = Methods) ->
-(TransportRpcModules = {http, ws, ipc}) -> (RpcServerConfig::start)
+- `crates/rpc/rpc-api`: `#[rpc]` traits and generated `*Server` traits.
+- `crates/rpc/rpc`: public namespaces such as `eth`, `debug`, `trace`, `net`, `web3`, `txpool`, `reth`, `rpc`, `ots`, `miner`, `mev`.
+- `crates/rpc/rpc-engine-api`: authenticated `engine_*` plus reth-specific engine helpers.
+- `crates/rpc/rpc-builder`: `RpcModuleBuilder`, `RpcRegistryInner`, `TransportRpcModules`, `RpcServerConfig`, auth server config.
+- `crates/rpc/rpc-layer`: JWT auth and other middleware layers.
+- `crates/rpc/rpc-server-types`: `RethRpcModule` and `RpcModuleSelection`.
+- `crates/rpc/ipc`: IPC transport implementation.
 
-(engine traits + engine impl) -> (AuthRpcModule) -> (AuthServerConfig::start)
-```
+## Flow
 
-## 1) RPC API Traits (Interface Layer)
+### 1. Define the namespace
 
-Primary entrypoint: `crates/rpc/rpc-api/src/lib.rs`
+`crates/rpc/rpc-api/src/lib.rs` re-exports server traits from namespace files such as:
 
-- Each namespace has its own module (e.g. `admin`, `debug`, `engine`, `net`, `trace`, `txpool`, `web3`, etc.).
-- Each module defines a `#[rpc(..., namespace = "...")]` trait.
-- `reth_rpc_api::servers` aggregates and re-exports all generated `*Server` traits so downstream code can depend on a single module.
+- `admin.rs`
+- `debug.rs`
+- `engine.rs`
+- `net.rs`
+- `trace.rs`
+- `txpool.rs`
+- `web3.rs`
 
-Example (custom namespace pattern, from an example):
+Each trait uses `jsonrpsee` macros. The namespace string becomes the RPC prefix.
 
-```rust
-#[rpc(server, namespace = "myrpcExt")]
-pub trait MyRpcExtApi {
-    #[method(name = "customMethod")]
-    fn custom_method(&self) -> EthResult<Option<Block>>;
-}
-```
+### 2. Implement the handler
 
-Key detail: the *method name seen by clients* is `"{namespace}_{method}"`, e.g. `"myrpcExt_customMethod"`.
+Concrete handlers live in `crates/rpc/rpc/src/` or `crates/rpc/rpc-engine-api/src/`.
 
-## 2) RPC Implementations (Handler Layer)
+Important pattern:
 
-Implementations live primarily in:
+- method traits stay transport-agnostic
+- handlers depend on node components such as provider, pool, network, EVM config, consensus handle
+- errors are translated into RPC error objects instead of panics
 
-- `crates/rpc/rpc/` (core namespaces like `eth_`, `debug_`, `trace_`, `admin_`, `net_`, `web3_`, etc.)
-- `crates/rpc/rpc-engine-api/` (Engine API implementation)
-- `crates/rpc/rpc-eth-api/` (shared eth logic and trait glue; depends on node components)
+### 3. Assemble transport modules
 
-Handlers typically:
+`crates/rpc/rpc-builder/src/lib.rs`
 
-- Hold references/clones of node components (provider, txpool, network, executor).
-- Implement the `jsonrpsee`-generated `*ApiServer` trait for that namespace.
-- Convert internal errors into `jsonrpsee_types::ErrorObject` (either directly or via crate error helpers).
+Core types:
 
-## 3) Module Builder (Assembly Layer)
+- `RpcModuleBuilder`: entrypoint that captures provider, pool, network, executor, EVM config, consensus.
+- `RpcRegistryInner`: lazily builds handler instances and namespace method sets.
+- `TransportRpcModuleConfig`: selects modules per transport.
+- `TransportRpcModules`: owns the actual HTTP / WS / IPC `RpcModule`s.
 
-### `RpcModuleBuilder`
+`RpcRegistryInner::reth_methods` maps `RethRpcModule` variants to handlers.
 
-Primary entrypoint: `crates/rpc/rpc-builder/src/lib.rs`
+Built-in module variants include:
 
-`RpcModuleBuilder<N, Provider, Pool, Network, EvmConfig, Consensus>` is a high-level assembler:
+- `eth`, `net`, `web3`
+- `admin`, `debug`, `trace`, `txpool`, `rpc`, `reth`, `ots`, `miner`, `mev`
 
-- It stores the core components needed to construct RPC handlers.
-- It exposes `with_provider`, `with_pool`, `with_network`, etc.
-- Its job is to produce configured `RpcModule`s (method registries) for each transport.
+Not auto-wired by default:
 
-The builder ultimately constructs an internal registry (`RpcRegistryInner`) that can:
+- `flashbots`
+- `testing`
+- `other(...)`
 
-- Instantiate default namespace handlers.
-- Convert them to `Methods` (`into_rpc()` from `jsonrpsee`).
-- Merge those `Methods` into a `RpcModule`.
+Those are expected to be installed through node-builder hooks.
 
-### `TransportRpcModuleConfig` and `RpcModuleSelection`
+### 4. Start transports
 
-Transport-specific API selection is captured by:
+`RpcServerConfig` starts public HTTP / WS / IPC servers.
 
-- `TransportRpcModuleConfig`: chooses a `RpcModuleSelection` for each transport (`http`, `ws`, `ipc`).
-- `RpcModuleSelection`: a parsed selection such as `All`, `Standard`, or an explicit set.
+The transport config answers two separate questions:
 
-At runtime, the registry creates per-transport modules via:
+- `TransportRpcModuleConfig`: which namespaces are exposed on each transport
+- `RpcServerConfig`: how the transports are served (address, CORS, limits, compression, IPC path, optional JWT layer)
 
-- `RpcRegistryInner::create_transport_rpc_modules(config) -> TransportRpcModules<()>`
+Defaults from `crates/rpc/rpc-builder/src/config.rs`:
 
-### `TransportRpcModules`
+- HTTP and WS default to standard modules when enabled: `eth`, `net`, `web3`
+- IPC defaults to all modules
 
-Defined in `crates/rpc/rpc-builder/src/lib.rs`.
+## Authenticated Engine API
 
-`TransportRpcModules<Context = ()>` is the container that holds:
+Engine API is a separate server path.
 
-- `config`: the original `TransportRpcModuleConfig`
-- `http: Option<RpcModule<Context>>`
-- `ws: Option<RpcModule<Context>>`
-- `ipc: Option<RpcModule<Context>>`
+Main files:
 
-It also exposes convenience APIs to mutate/extend the modules:
+- `crates/rpc/rpc-engine-api/src/engine_api.rs`
+- `crates/rpc/rpc-builder/src/auth.rs`
+- `crates/rpc/rpc-layer/src/auth_layer.rs`
 
-- `merge_configured(methods)`: merges into all configured transports.
-- `merge_if_module_configured(module, methods)`: merges only into transports where `module` is enabled.
-- `methods_by_module(module)`: returns method inventory for a namespace prefix.
-- `remove_method(...)` (and friends) for targeted mutation.
+`RpcRegistryInner::create_auth_module` builds an auth module from:
 
-### Default module construction (`reth_methods`)
+- `engine_*`
+- `reth_` engine helpers
+- a small `eth_*` subset via `EngineEthApi`
 
-The default namespaces are wired in `RpcRegistryInner::reth_methods(...)` in `crates/rpc/rpc-builder/src/lib.rs`.
+`AuthServerConfig` starts the JWT-protected auth server. This is distinct from public HTTP / WS / IPC RPC.
 
-- Each `RethRpcModule` maps to a handler instance and its `into_rpc()` methods.
-- Some namespaces are composites (notably `eth_`), where `eth` methods are merged from multiple handler structs.
-- Some module variants are intentionally *not* auto-wired:
-  - `Flashbots`, `Testing`, and `Other(...)` are marked as implementation-specific and expected to be installed via the node-builder hook layer (see below).
+## Node-builder integration
 
-## 4) Server Configuration and Startup (Transport Layer)
+`crates/node/builder/src/rpc.rs`
 
-### `RpcServerConfig`
+The node builder owns final RPC assembly.
 
-Defined in `crates/rpc/rpc-builder/src/lib.rs`.
+Key hook points:
 
-`RpcServerConfig` is responsible for starting the public JSON-RPC servers:
+- `extend_rpc_modules`: mutate public and auth modules before startup
+- `on_rpc_started`: inspect handles after startup
 
-- HTTP (jsonrpsee HTTP server)
-- WS (jsonrpsee WS server)
-- IPC (Reth IPC adapter)
+Useful context objects:
 
-It contains, at a high level:
+- `ctx.modules`: public transport modules
+- `ctx.auth_module`: authenticated engine/auth module
+- `ctx.registry`: factory/registry for built-in handlers
 
-- Optional HTTP/WS `ServerConfigBuilder`
-- Optional IPC builder + endpoint
-- CORS configuration for HTTP/WS
-- HTTP compression toggle
-- Optional `jwt_secret` (used for authenticated endpoints / auth-related plumbing)
-- An RPC middleware stack applied across transports
+## Extension surface
 
-It also sets the default subscription ID provider:
+The least invasive extension path is `NodeBuilder::extend_rpc_modules`.
 
-- HTTP/WS/IPC defaults to `EthSubscriptionIdProvider` unless overridden.
+`TransportRpcModules` supports:
 
-### HTTP / WS / IPC
+- `merge_configured`: add methods to all enabled transports
+- `merge_if_module_configured`: add methods only when a module is selected
+- `remove_method_from_configured`: delete an existing method from all enabled transports
+- `rename`: remove a method and merge a replacement
+- `methods_by_module`: inspect installed methods by prefix
 
-- HTTP and WS are built using `jsonrpsee::server::ServerBuilder` and `ServerConfigBuilder`.
-- IPC is provided by `reth_ipc` (an adapter that mirrors jsonrpsee-style RPC behavior over an IPC transport).
+This lets downstream nodes add or replace RPC methods without forking the whole server stack.
 
-The important operational concept:
+## Transport and operator configuration
 
-- The server config is separate from module config.
-  - `TransportRpcModuleConfig` answers “what APIs exist on each transport”.
-  - `RpcServerConfig` answers “how do we serve them (addresses, CORS, middleware, IPC endpoint, etc.)”.
+Primary config sources:
 
-## 5) Auth / JWT (Engine API Server)
+- `crates/rpc/rpc-builder/src/config.rs`
+- `crates/node/core/src/args/rpc_server.rs`
 
-Reth runs the Engine API behind an authenticated server.
+Important flags:
 
-### `AuthLayer` and JWT validation
+- `--http`, `--http.api`, `--http.addr`, `--http.port`
+- `--ws`, `--ws.api`, `--ws.addr`, `--ws.port`
+- `--ipcdisable`, `--ipcpath`
+- `--authrpc.addr`, `--authrpc.port`, `--authrpc.jwtsecret`, `--disable-auth-server`
+- `--rpc.jwtsecret` for optional JWT on public RPC, separate from auth server JWT
 
-JWT auth is implemented as an HTTP middleware layer in `crates/rpc/rpc-layer/src/auth_layer.rs`.
+## Retrieval map
 
-- Requests are intercepted and the `Authorization` header is validated.
-- Invalid requests are blocked early with an HTTP error response.
-- Valid requests are forwarded to the inner RPC service.
-
-### `AuthServerConfig` and `AuthRpcModule`
-
-Auth server code lives in `crates/rpc/rpc-builder/src/auth.rs`.
-
-- `AuthServerConfig` binds an address + JWT secret and starts a jsonrpsee server with an `AuthLayer(JwtAuthValidator)` middleware.
-- It can also optionally start an Engine API IPC server (`DEFAULT_ENGINE_API_IPC_ENDPOINT`), if configured.
-
-`AuthRpcModule` is a thin wrapper around `RpcModule<()>` with utilities to:
-
-- `merge_auth_methods(...)`
-- `replace_auth_methods(...)`
-- `remove_auth_method(...)`
-
-### What is exposed on the auth server
-
-The default auth module assembly happens in:
-
-- `RpcRegistryInner::create_auth_module(engine_api: impl IntoEngineApiRpcModule) -> AuthRpcModule`
-
-It does two key things:
-
-- Starts from the provided Engine API module (`engine_` namespace).
-- Merges a subset of `eth_` handlers required by the Engine API workflow via `EngineEthApi`.
-
-This is intentionally separate from the public `eth_` module selection.
-
-### `AuthServerHandle`
-
-`AuthServerHandle` provides:
-
-- The local address
-- The JWT secret
-- Convenience authenticated clients:
-  - `http_client()` adds a JWT per request via a client middleware.
-  - `ws_client()` sets an `Authorization` header, but note JWT expiry constraints.
-  - optional `ipc_client()` on unix if IPC is enabled.
-
-## 6) Node Builder Integration (Wiring Layer)
-
-The node builder integrates the RPC stack as a “node add-on” and provides extension hooks.
-
-Key file: `crates/node/builder/src/rpc.rs`
-
-- `RpcAddOns` is responsible for launching:
-  - public RPC servers (HTTP/WS/IPC) via `RpcServerConfig`
-  - auth server (Engine API) via `AuthServerConfig`
-- `RpcHooks` includes:
-  - `extend_rpc_modules`: mutate modules right before servers start
-  - `on_rpc_started`: observe handles after startup
-
-The high-level flow is:
-
-1. Build default transport modules (`TransportRpcModules`) from `TransportRpcModuleConfig`.
-2. Build auth module (`AuthRpcModule`) from Engine API + `EngineEthApi` subset.
-3. Invoke `extend_rpc_modules` hook so the node (or downstream integrator) can merge/replace methods.
-4. Start servers.
-
-## Pointers
-
-- RPC trait registry: `crates/rpc/rpc-api/src/lib.rs`
-- Module/transport builder: `crates/rpc/rpc-builder/src/lib.rs`
-- Auth server: `crates/rpc/rpc-builder/src/auth.rs`
-- Auth middleware layer: `crates/rpc/rpc-layer/src/auth_layer.rs`
-- Node hooks: `crates/node/builder/src/rpc.rs`
-- Example (standalone + custom namespace): `examples/rpc-db/src/main.rs`
-- Example (NodeBuilder hook): `examples/node-custom-rpc/src/main.rs`
+- traits: `crates/rpc/rpc-api/src/lib.rs`
+- handler implementations: `crates/rpc/rpc/src/`, `crates/rpc/rpc-engine-api/src/`
+- module builder and transport containers: `crates/rpc/rpc-builder/src/lib.rs`
+- auth server: `crates/rpc/rpc-builder/src/auth.rs`
+- config from CLI args: `crates/rpc/rpc-builder/src/config.rs`
+- node integration: `crates/node/builder/src/rpc.rs`

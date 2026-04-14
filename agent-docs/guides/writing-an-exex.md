@@ -1,204 +1,115 @@
 # Writing an ExEx
 
-This guide shows how to write an Execution Extension (ExEx) that:
+Use this path when you want a long-running extension that reacts to canonical chain changes and optionally exposes custom services such as RPC subscriptions.
 
-- Subscribes to `ExExNotification`s.
-- Handles commit/reorg/revert.
-- Tracks and persists a finished height (head) for restart safety.
-- Emits `FinishedHeight` for pruning.
-- Understands WAL behavior and what it implies for recovery.
+## Fast workflow
 
-The goal is a pattern you can copy into your own ExEx.
+1. define an async function that takes `ExExContext<Node>`
+2. read from `ctx.notifications`
+3. handle commit, reorg, and revert cases
+4. emit `FinishedHeight` after state is safe to prune
+5. install with `NodeBuilder::install_exex`
+6. if needed, combine with `extend_rpc_modules` or custom node components
 
-## Mental Model
+See `examples/exex-subscription/src/main.rs` for the highest-signal end-to-end example.
 
-- The node produces `ExExNotification` whenever blocks are executed during sync and live operation.
-- Your ExEx consumes these notifications and updates derived state.
-- Reorgs/reverts are represented explicitly; you must apply them to your derived state.
-- You should periodically emit `FinishedHeight` once processed state is durable.
+## Minimal processing loop
 
-Two "progress" concepts matter:
+The normal loop shape is:
 
-- `FinishedHeight` (event you emit): used by the node/manager for pruning and skipping already-processed committed notifications.
-- `ExExHead` (what you persist): used by `ExExNotificationsWithHead` to reconcile on restart.
+- await the next `ctx.notifications` item
+- apply changes for committed chain segments
+- undo or recompute on reorg / revert
+- advance `ctx.send_finished_height(...)` or `ctx.events.send(ExExEvent::FinishedHeight(...))`
 
-## Skeleton ExEx Implementation
+Use `committed_chain()` when your derived state is append-oriented.
 
-Most ExExes look like a stream loop.
+Use explicit `ChainReorged` or `reverted_chain()` handling when your derived state must roll back.
 
-```rust
-use futures::TryStreamExt;
-use reth_exex::{ExExContext, ExExEvent, ExExNotification};
-use reth_node_api::FullNodeComponents;
+## Choosing notification mode
 
-async fn my_exex<Node: FullNodeComponents>(mut ctx: ExExContext<Node>) -> eyre::Result<()> {
-    // Optional: configure the notifications stream mode here.
-    // ctx.set_notifications_without_head();
+### Live only
 
-    while let Some(notification) = ctx.notifications.try_next().await? {
-        match &notification {
-            ExExNotification::ChainCommitted { new } => {
-                // Process new canonical blocks.
-                // new.blocks_iter() gives blocks in order.
-                // new.state() gives execution outcome/bundle.
-                let _range = new.range();
-            }
-            ExExNotification::ChainReorged { old, new } => {
-                // Undo effects of old chain, apply effects of new chain.
-                let _from = old.range();
-                let _to = new.range();
-            }
-            ExExNotification::ChainReverted { old } => {
-                // Undo effects of reverted blocks.
-                let _range = old.range();
-            }
-        }
+Default behavior is live notifications from the moment the node launches the ExEx.
 
-        // After applying the notification and making derived state durable,
-        // advance finished height based on the committed chain tip.
-        if let Some(committed_chain) = notification.committed_chain() {
-            ctx.events.send(ExExEvent::FinishedHeight(committed_chain.tip().num_hash()))?;
-        }
-    }
+Use this when:
 
-    Ok(())
-}
-```
+- the ExEx does not persist its own head
+- replay is unnecessary
+- missing historical work is acceptable
 
-## Handling Commit/Reorg/Revert Correctly
+### Resume from a stored head
 
-A safe derived-state strategy is:
+Use `ctx.set_notifications_with_head(exex_head)` when the ExEx stores its own last-applied block.
 
-- Commit:
-  - Apply blocks in order.
-  - Persist derived outputs for each block (or batch).
-  - Update your stored head to the tip.
+Use this when:
 
-- Reorg:
-  - Revert all blocks in `old` (typically in reverse order).
-  - Apply all blocks in `new` (in forward order).
-  - Update stored head to the new tip.
+- the ExEx must recover deterministically after restart
+- the ExEx owns durable derived state
+- historical catch-up matters
 
-- Revert:
-  - Revert all blocks in `old`.
-  - Update stored head to the parent of the first reverted block.
+Backfill is implemented in `crates/exex/exex/src/notifications.rs` and uses node providers plus the WAL.
 
-Practical tip:
+## Accessing node components
 
-- If your derived state supports idempotent writes keyed by block hash, you can simplify reorg logic.
-- Otherwise, keep a per-block journal/undo log in your own storage.
+`ExExContext` gives direct access to the launched node through helpers in `crates/exex/exex/src/context.rs`:
 
-## Tracking Finished Height vs Persisted Head
+- `provider()` for reads against chain/state data
+- `pool()` for transaction-pool access
+- `network()` for network handle access
+- `payload_builder_handle()` for payload-builder coordination
+- `task_executor()` to spawn work without blocking the main notification loop
 
-### `FinishedHeight` (node-facing)
+This is the main extensibility bridge between ExEx and broader custom-node workflows.
 
-Emit `ExExEvent::FinishedHeight(BlockNumHash)` when:
+## Installing the ExEx
 
-- You have processed all blocks up to that point.
-- You have persisted your derived state so it is safe for the node to prune.
+Install through the builder before `launch()`:
 
-Why it matters:
+- `crates/node/builder/src/builder/mod.rs`: `install_exex`
+- `crates/node/builder/src/builder/states.rs`: storage of installed extensions
+- `crates/node/builder/src/launch/exex.rs`: launch order and manager wiring
 
-- The manager may skip `ChainCommitted` notifications whose tip is `<= finished_height.number`.
-- The node uses the minimum finished height across all ExExes to decide what can be pruned.
+If the extension also needs RPC, pair it with `extend_rpc_modules`, as shown in `examples/exex-subscription/src/main.rs`.
 
-Rules of thumb:
+## Common patterns
 
-- Emit frequently (after each committed chain, or every N blocks) to avoid WAL growth warnings.
-- Never emit ahead of what you can recover from.
+### Indexer / off-chain projector
 
-### `ExExHead` (restart-facing)
+- read committed blocks
+- derive external state
+- checkpoint last applied block
+- emit finished height after durable write succeeds
 
-`ExExHead { block: BlockNumHash }` is what *you* should persist (e.g., a small file or your DB).
+### RPC-backed watcher
 
-On restart, you should:
+- keep a subscription registry inside the ExEx
+- update subscribers from chain notifications
+- register custom RPC methods through `extend_rpc_modules`
 
-1) Load your last persisted head.
-2) Configure the notifications stream using that head.
+### Testable extension
 
-```rust
-use reth_exex_types::ExExHead;
+- drive the node with `reth_e2e_test_utils`
+- install the ExEx in a test/example binary
+- assert notification counts, finalized heights, or derived-state changes
 
-// Suppose `stored` is a BlockNumHash you loaded from disk.
-ctx.set_notifications_with_head(ExExHead::new(stored));
-```
+See `examples/exex-test/src/main.rs`.
 
-Why it matters:
+## Failure rules
 
-- Head-based notifications can reconcile if your stored head is no longer canonical.
-- They can backfill from the node database if you are behind the node head.
+- Do not let the ExEx future finish normally; launched ExExs are expected to run indefinitely.
+- Treat reorg handling as required, not optional.
+- Emit finished height only after earlier blocks are no longer needed.
+- Move expensive work off the main notification loop if it can stall delivery.
 
-If you do not persist a head and always start "without head":
+## Best files to read next
 
-- You are relying on best-effort delivery and may miss reconciliation steps after crashes.
-
-## WAL Behavior (What You Need to Know)
-
-Reth maintains an ExEx Write-Ahead Log (WAL) for notifications from the live blockchain tree.
-
-Key points:
-
-- Only notifications with source `BlockchainTree` are committed to WAL.
-- Notifications from the pipeline (`ExExNotificationSource::Pipeline`) are not committed (they are treated as finalized).
-- WAL is finalized when finalized headers arrive *and* all ExExes are on the canonical chain. If ExExes do not emit `FinishedHeight`, the WAL can grow indefinitely.
-
-What this means for your ExEx:
-
-- You normally do not read WAL directly.
-- The `ExExNotificationsWithHead` mode uses WAL to repair cases where your stored head hash is not canonical:
-  - It fetches the committed notification for your head from WAL.
-  - It emits the inverse notification (`into_inverted()`), which drives your ExEx to revert to the parent head.
-
-If the WAL does not contain the needed notification (e.g., it was finalized or never recorded), restart reconciliation may fail.
-
-Practical guidance:
-
-- Persist your head frequently.
-- Emit `FinishedHeight` so WAL can be finalized.
-- Keep derived-state rollback data for at least as long as you might need to handle a reorg.
-
-## Putting It Together: A Robust Pattern
-
-1) Startup:
-
-- Load persisted head (`BlockNumHash`) from your storage.
-- Call `ctx.set_notifications_with_head(ExExHead::new(stored_head))`.
-
-2) Main loop:
-
-- Consume notifications.
-- Apply them to derived state (with rollback support).
-- Persist derived outputs.
-- Update persisted head.
-- Emit `FinishedHeight` at the new committed tip.
-
-3) Reorg handling:
-
-- Always treat `ChainReorged` and `ChainReverted` as authoritative, even if they are below your last reported finished height.
-
-## Installation via Node Builder
-
-When using the node builder, you typically install an ExEx by name and an async initializer that receives `ExExContext`:
-
-```rust
-// builder.install_exex("my-exex", async move |ctx| Ok(my_exex(ctx)))
-```
-
-The initializer returns the ExEx future that will be spawned as a critical task.
-
-## Common Pitfalls
-
-- Not emitting `FinishedHeight`: WAL grows and pruning may be blocked.
-- Emitting `FinishedHeight` before data is durable: pruning can make recovery impossible.
-- Ignoring reorg/revert variants: derived state becomes inconsistent.
-- Persisting only a block number, not `BlockNumHash`: you lose the ability to detect canonicality precisely.
-
-## Relevant References
-
-- `crates/exex/exex/src/context.rs` (context + `send_finished_height` + notification mode)
-- `crates/exex/types/src/notification.rs` (`ExExNotification` helpers)
-- `crates/exex/exex/src/notifications.rs` (head mode: canonicality checks + backfill)
-- `crates/exex/exex/src/wal/mod.rs` (WAL design)
-- `crates/exex/exex/src/manager.rs` (buffering, skipping logic, WAL finalization)
-- `crates/stages/stages/src/stages/execution.rs` (pipeline notification emission)
-- `crates/node/builder/src/launch/exex.rs` (launch wiring)
+- ExEx API: `crates/exex/exex/src/lib.rs`
+- context helpers: `crates/exex/exex/src/context.rs`
+- notification semantics: `crates/exex/types/src/notification.rs`
+- manager behavior: `crates/exex/exex/src/manager.rs`
+- install hook: `crates/node/builder/src/exex.rs`
+- launch glue: `crates/node/builder/src/launch/exex.rs`
+- RPC pairing example: `examples/exex-subscription/src/main.rs`
+- test example: `examples/exex-test/src/main.rs`
+- broader builder customization: `examples/custom-node-components/src/main.rs`

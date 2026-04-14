@@ -1,151 +1,97 @@
-# Testing & CI
+# Testing and CI
 
-This document describes how testing is organized in this repo, how CI exercises the various layers, and which commands/workflows are the practical entry points.
+Reth splits verification into fast crate-local checks, integration suites, fixture-driven protocol tests, and repo-wide CI gates.
 
-## Testing Layers
+## Local entry points
 
-### 1) Unit tests (crate-local)
+- `Makefile:158`: `make test-unit` installs `cargo-nextest` and runs unit-style workspace tests.
+- `Makefile:192`: `make ef-tests` downloads EF + EEST fixtures and runs `ef-tests`.
+- `Makefile:291`: `make lint` runs formatting, clippy, typos, and TOML checks.
+- `Makefile:339`: `make pr` is the broad local pre-PR gate: lint, CLI doc regeneration, rustdoc, tests.
 
-- Location: inline Rust tests inside crates (e.g. `src/` modules with `#[cfg(test)]`).
-- How they run in CI: primarily via `cargo nextest run` with expressions that exclude integration-style `tests/` (see `.github/workflows/unit.yml`).
-- Why it matters: fastest feedback; most contributors should keep a tight loop here.
+## Test layers
 
-### 2) Integration tests (crate `tests/`)
+### Unit / crate-local tests
 
-- Location: per-crate `tests/` directories.
-- How they run in CI: via `.github/workflows/integration.yml`.
-- Notable dependency: CI installs Geth for integration coverage (some tests rely on interacting with a reference client).
+- Main CI workflow: `.github/workflows/unit.yml` job `test`.
+- Selector: `cargo nextest run ... -E "!kind(test) and not binary(e2e_testsuite)"`.
+- Meaning: runs library, binary, and proc-macro tests; excludes integration tests and e2e testsuite binaries.
 
-### 3) E2E testsuite (multi-node / node-level behavior)
+### Integration tests
 
-Reth has a dedicated end-to-end testsuite framework:
+- Main CI workflow: `.github/workflows/integration.yml` job `test`.
+- Selector: `cargo nextest run ... -E "kind(test) and not binary(e2e_testsuite)"`.
+- Meaning: runs crate `tests/` targets.
+- Extra requirement: installs Geth first via `.github/scripts/install_geth.sh`.
 
-- Framework: `crates/e2e-test-utils/src/testsuite/`.
-- Convention:
-  - Each crate that has e2e tests places them under `tests/e2e-testsuite/`.
-  - The test binary must be named `e2e_testsuite` (required for nextest filters and CI workflow selection).
-- What these tests cover: node-level behavior (block production, forks/reorgs, Engine API interactions, multi-node sync) driven via a higher-level "testsuite" API.
+### E2E testsuite
 
-CI execution:
+- Main CI workflow: `.github/workflows/e2e.yml` job `test`.
+- Selector: `cargo nextest run ... -E 'binary(e2e_testsuite)'`.
+- Convention: e2e suites live under `tests/e2e-testsuite/` and build a binary named `e2e_testsuite`.
+- Separate RocksDB-specific coverage runs in `.github/workflows/e2e.yml` job `rocksdb`.
 
-- Workflow: `.github/workflows/e2e.yml`.
-- Runner: `cargo nextest run ... -E 'binary(e2e_testsuite)'`.
-- Nextest timeouts: `.config/nextest.toml` increases timeouts for the `binary(e2e_testsuite)` filter.
+### EF / EEST fixture tests
 
-### 4) EF / EEST fixtures (fixture-driven protocol conformance)
+- Local helper: `Makefile:192`.
+- CI job: `.github/workflows/unit.yml` job `state`.
+- Fixture sources:
+  - EF legacy tests under `testing/ef-tests/ethereum-tests`
+  - EEST fixtures under `testing/ef-tests/execution-spec-tests`
+- Harness package: `testing/ef-tests` (`ef-tests`).
 
-Reth runs fixture-based protocol tests that come from two upstream sources:
+### Doc tests
 
-- EF legacy tests (`ethereum/tests`)
-  - Downloaded into: `testing/ef-tests/ethereum-tests/`.
-  - Primarily uses `BlockchainTests` / `GeneralStateTests` JSON fixtures.
-- EEST fixtures (`ethereum/execution-spec-tests`)
-  - Downloaded into: `testing/ef-tests/execution-spec-tests/`.
-  - Stable fixture tarball is used.
+- CI job: `.github/workflows/unit.yml` job `doc`.
+- Command: `cargo test --doc --workspace --all-features`.
 
-Harness:
+## Nextest policy
 
-- Test harness crate: `testing/ef-tests` (package name `ef-tests`).
-- Test entry points (in that crate):
-  - `general_state_tests::*` (EF GeneralStateTests groups).
-  - `eest_fixtures` (EEST fixture run).
-
-CI execution:
-
-- Workflow: `.github/workflows/unit.yml` includes a dedicated "state tests" job.
-  - Checks out `ethereum/tests` into `testing/ef-tests/ethereum-tests`.
-  - Downloads EEST fixture tarball and extracts into `testing/ef-tests/execution-spec-tests`.
-  - Runs: `cargo nextest run --release -p ef-tests --features "asm-keccak ef-tests"`.
-
-Local execution:
-
-- `make ef-tests` downloads both fixture sets and runs the `ef-tests` package via nextest.
-
-## Tooling
-
-### cargo-nextest
-
-This repo standardizes on `cargo nextest` for local and CI parity:
-
-- CI uses `taiki-e/install-action@nextest` and runs `cargo nextest run ...` across workflows.
-- Local helper targets install and use nextest (see `Makefile`).
-
-Useful nextest selection primitives:
-
-- `-p <package>`: narrow to one crate.
-- `--test <name>` / `--bin <name>`: narrow to a specific integration test target or binary.
-- `-E '<expr>'`: nextest expression filtering.
-  - Used heavily in CI to partition unit vs integration vs e2e.
-
-### Nextest configuration
-
-File: `.config/nextest.toml`
-
-- Retries enabled by default with exponential backoff (`count = 2`).
-- Slow timeout defaults to 30s periods, terminates after 4 periods.
-- Overrides extend timeouts for known-slower classes:
+- Config file: `.config/nextest.toml`.
+- Default profile retries flaky tests twice with exponential backoff.
+- Slow-timeout overrides exist for:
   - `test(general_state_tests)`
   - `test(eest_fixtures)`
   - `binary(e2e_testsuite)`
   - `package(reth-era) and binary(it)`
   - `package(reth-node-ethereum) and binary(e2e)`
 
-### Make targets (developer entry points)
+## CI map
 
-File: `Makefile`
+### Core PR / merge-queue gates
 
-Common targets used by contributors:
+- `.github/workflows/lint.yml`: clippy, fmt, rustdoc, CLI-doc regeneration check, udeps, wasm/riscv checks, feature propagation, typos, TOML checks.
+- `.github/workflows/unit.yml`: unit-style nextest partitions, state fixtures, doctests.
+- `.github/workflows/integration.yml`: integration tests with Geth; scheduled era-file integration test.
+- `.github/workflows/e2e.yml`: testsuite-driven node-level coverage.
 
-- `make test-unit`
-  - Installs `cargo-nextest` and runs a "unit-style" nextest selection over the workspace.
-- `make ef-tests`
-  - Downloads EF + EEST fixtures into `testing/ef-tests/` and runs `-p ef-tests --release --features ef-tests`.
-- `make cov-unit`
-  - Runs unit tests with coverage via `cargo llvm-cov nextest` (outputs `lcov.info`).
-- `make lint`
-  - Runs formatting + clippy + typos + TOML formatting.
-- `make pr`
-  - Local "pre-PR" gate: lint + regenerate CLI docs + docs build + tests.
+### Deeper system validation
 
-## CI Workflows (what runs where)
+- `.github/workflows/sync.yml`: bounded sync/unwind coverage.
+- `.github/workflows/stage.yml`: `reth stage run` coverage.
+- `.github/workflows/hive.yml`: `ethereum/hive` scenarios.
+- `.github/workflows/kurtosis.yml`: multi-node Kurtosis + Assertoor validation.
 
-High-level map (see `docs/repo/ci.md` for the index):
+### Docs / release / packaging
 
-### PR / merge-queue gates
+- `.github/workflows/book.yml`: builds Vocs site and cargo docs content.
+- `.github/workflows/release.yml`, `release-dist.yml`, `release-reproducible.yml`: release and distribution paths.
 
-- Lint: `.github/workflows/lint.yml`
-  - clippy (multiple configurations), fmt check, docs build, feature checks, dependency checks, typos, TOML formatting, etc.
-- Unit: `.github/workflows/unit.yml`
-  - Nextest runs partitioned across matrices (ethereum/optimism; stable/edge storage).
-  - Separate job for EF/EEST state tests.
-  - Doctests via `cargo test --doc --workspace --all-features`.
-- Integration: `.github/workflows/integration.yml`
-  - Runs integration tests (includes installing Geth).
-- E2E testsuite: `.github/workflows/e2e.yml`
-  - Runs only `binary(e2e_testsuite)` across the workspace.
+## Common CI assumptions
 
-### Scheduled / periodic deeper integration
+- `SEED` is fixed in test workflows for reproducibility.
+- `RUSTC_WRAPPER=sccache` is standard in CI.
+- `cargo-nextest` is the default runner for test parity between local and CI paths.
 
-- Sync tests: `.github/workflows/sync.yml`
-  - Builds `reth` / `op-reth`, runs a bounded sync to a configured tip hash, verifies, and exercises unwind.
-- Stage run tests: `.github/workflows/stage.yml`
-  - Runs `reth stage run ...` commands.
-  - Currently configured to run only in merge queue (`merge_group`).
-- Hive: `.github/workflows/hive.yml`
-  - Runs `ethereum/hive` scenarios in Docker (stable/edge variants).
-- Kurtosis: `.github/workflows/kurtosis.yml`
-  - Spins up a Kurtosis testnet and runs Assertoor tests.
+## Retrieval map
 
-## Fixture Sources and Versions
-
-The fixture versions are pinned for reproducibility:
-
-- EF tests tag is pinned in `Makefile` (downloaded from `ethereum/tests`).
-- EEST fixtures tag is pinned in `Makefile` (downloaded from `execution-spec-tests` fixture tarballs).
-
-CI may additionally pin EF fixtures by commit (see `.github/workflows/unit.yml`).
-
-## Determinism
-
-- Many CI workflows set `SEED` to a fixed string.
-- Locally, you can set `SEED=<string>` to stabilize tests that use RNG.
+- `Makefile:158`
+- `Makefile:192`
+- `Makefile:291`
+- `Makefile:339`
+- `.config/nextest.toml`
+- `.github/workflows/unit.yml`
+- `.github/workflows/integration.yml`
+- `.github/workflows/e2e.yml`
+- `.github/workflows/lint.yml`
+- `docs/repo/ci.md`

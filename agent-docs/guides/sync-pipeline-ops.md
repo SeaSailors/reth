@@ -1,208 +1,147 @@
 # Sync Pipeline Ops Guide
 
-This guide is aimed at node operators and on-call engineers. It explains how to interpret staged-sync progress, when/why unwinds happen, and where to look for errors, metrics, and logs.
+This guide is for debugging staged sync from the CLI or from logs/metrics.
 
-## Mental Model
+## Mental model
 
-- Sync is a loop over an ordered list of stages.
-- Each stage persists a **checkpoint** (`StageCheckpoint`) to the DB.
-- The pipeline commits after each stage iteration, so progress is durable and resumable.
-- If the chain reorganizes or validation fails, the pipeline **unwinds** stages in reverse order to a safe block.
+- sync is an ordered list of stages
+- each stage persists a checkpoint after every successful iteration
+- later stages usually trail the immediately previous stage
+- unwind walks stages in reverse order to get back to a safe block
 
-## Stage Progress: What to Look At
+If one stage looks stuck, compare it against the checkpoint of the stage just before it.
 
-### Primary source of truth: stage checkpoints
+## Default stage order to read in practice
 
-Stage checkpoints are stored in the DB table:
+1. `Headers`
+2. `Bodies`
+3. `SenderRecovery`
+4. `Execution`
+5. `MerkleUnwind` / hashing / `MerkleExecute`
+6. lookup and history indexing
+7. `Prune`
+8. `Finish`
 
-- `StageCheckpoints: StageId -> StageCheckpoint`
+Typical interpretation:
 
-A `StageCheckpoint` includes:
+- `Headers` stalled: peer, downloader, or tip-tracking problem
+- `Bodies` stalled: downloader throughput or peer availability problem
+- `Execution` stalled: CPU, IO, or state-write bottleneck
+- hashing / merkle stalled: trie-heavy catch-up or storage pressure
+- lookup/history stalled: post-execution indexing backlog
 
-- `block_number`: “highest processed block” for that stage.
-- optional stage-specific checkpoint payload (`StageUnitCheckpoint`) for stages that track entities/block ranges.
+## Primary inspection commands
 
-There is also a secondary table:
+- checkpoint inspection: `reth db stage-checkpoints get`
+- single-stage checkpoint update: `reth db stage-checkpoints set`
+- bounded stage execution: `reth stage run`
+- manual rewind: `reth stage unwind`
+- destructive table reset for a stage: `reth stage drop`
 
-- `StageCheckpointProgresses: StageId -> Vec<u8>`
+`reth stage run` is a debugging tool, not the normal full-pipeline path. `crates/cli/commands/src/stage/mod.rs` notes that it does not use the full pipeline orchestration and may hold large ranges in memory.
 
-This is used for stage-specific “first sync” progress tracking. It is not a replacement for the main checkpoint.
+## What `reth stage run` is good for
 
-### Reading “where sync is at”
+Use `crates/cli/commands/src/stage/run.rs` when you need a narrow reproduction for one stage.
 
-In practice, sync health is best understood by comparing checkpoints across stages:
+High-signal flags:
 
-- **Early download stages** (`Headers`, `Bodies`) should be at or near the network tip.
-- **Execution** should track behind bodies by an amount that depends on hardware.
-- **Trie / hashing stages** (`AccountHashing`, `StorageHashing`, `MerkleExecute`) typically lag execution during heavy catch-up.
-- **Indexing + pruning** stages run after the trie work and may lag behind until the node is mostly caught up.
+- `--from` / `--to`: restrict the block window
+- `--batch-size`: reduce a failing range
+- `--skip-unwind`: only when the range has never been written before
+- `--commit`: required for stages that rewrite static-file-backed data
+- `--checkpoints`: persist stage checkpoint updates from the run
 
-When a later stage is blocked, check whether the immediately preceding stage has reached the same target; the pipeline caps each stage’s `target` to the previous stage’s checkpoint.
+`Headers`, `Bodies`, and `Execution` have extra network/static-file requirements in this command path.
 
-## Default Stage Ordering (Operator View)
+## What `reth stage unwind` is good for
 
-Reth full sync typically runs the following sequence (from `DefaultStages`):
+`crates/cli/commands/src/stage/unwind.rs` builds a pipeline and rewinds to either:
 
-- `Era` (optional)
-- `Headers`
-- `Bodies`
-- `SenderRecovery`
-- `Execution`
-- `PruneSenderRecovery`
-- `MerkleUnwind`
-- `AccountHashing`
-- `StorageHashing`
-- `MerkleExecute`
-- `TransactionLookup`
-- `IndexStorageHistory`
-- `IndexAccountHistory`
-- `Prune`
-- `Finish`
+- a specific block or hash: `to-block`
+- a relative distance from tip: `num-blocks`
 
-A common operator expectation:
+Useful behavior:
 
-- If `Headers` is stalled, the node likely has a network / peer / downloader issue.
-- If `Bodies` is stalled, check peers and body downloader backpressure.
-- If `Execution` is stalled, check CPU/IO saturation and DB write performance.
-- If hashing/merkle is stalled, check DB size, trie workload, and disk.
+- `--offline` unwinds only offline data stages
+- the command moves eligible data to static files before unwind
+- prune settings can block an unwind target that is already pruned
 
-## Pipeline Events and Log Targets
+## Reading checkpoints
 
-### Pipeline events
+Checkpoint truth lives behind `StageCheckpointReader` and is exposed by `reth db stage-checkpoints`.
 
-The pipeline emits structured events (`PipelineEvent`):
+When reading output:
 
-- `Prepare { stage_id, checkpoint, target, pipeline_stages_progress }`
-- `Run { .. }`
-- `Ran { stage_id, result: ExecOutput }`
-- `Unwind { stage_id, input: UnwindInput }`
-- `Unwound { stage_id, result: UnwindOutput }`
-- `Error { stage_id }`
-- `Skipped { stage_id }`
+- compare all stage heights, not just one
+- a flat checkpoint with growing upstream checkpoints means backlog, not necessarily failure
+- a stage-specific checkpoint payload can show partial progress inside one block span
 
-These events are useful when building tooling that needs to display “what is it doing right now?” and “what stage is failing?”.
+Relevant code:
 
-### Tracing targets (where logs land)
+- CLI read/write: `crates/cli/commands/src/db/stage_checkpoints.rs`
+- checkpoint types: `crates/stages/types/src/checkpoints.rs`
 
-Reth uses `tracing` with explicit targets in several key places:
+## Logs and events
 
-- `sync::pipeline`
-  - stage start/end, unwind start/end, error classification, detached-head handling.
-- `sync::stages`
-  - some stage helpers/internals (for example, `ExecInput` range computation is instrumented here).
-- `sync::metrics`
-  - metric event processing.
+Start with tracing target `sync::pipeline`.
 
-If you’re filtering logs, start with `sync::pipeline` at `info`/`debug` levels.
+Important pipeline events from `crates/stages/api/src/pipeline/event.rs`:
 
-## Metrics: What’s Available
+- `Prepare`
+- `Run`
+- `Ran`
+- `Unwind`
+- `Unwound`
+- `Error`
+- `Skipped`
 
-The pipeline can emit metric events (`MetricEvent`) that drive stage metrics.
+These answer two fast questions:
 
-Two important event types:
+- which stage is active now
+- did it advance, retry, skip, or unwind
 
-- `MetricEvent::StageCheckpoint { stage_id, checkpoint, max_block_number, elapsed }`
-- `MetricEvent::SyncHeight { height }`
+## Metrics to watch
 
-For each stage, the metrics layer tracks at least:
+`crates/stages/api/src/metrics/listener.rs` records per-stage:
 
-- checkpoint height (block number)
-- entities processed / entities total
+- checkpoint height
+- processed entities
+- total entities when known
 - accumulated elapsed time
 
-For stages that expose `EntitiesCheckpoint` in their `StageCheckpoint`, “entities processed/total” will reflect entity counts rather than block numbers.
+Operational heuristics:
 
-Operationally:
+- flat checkpoint + flat processed entities = likely stall
+- flat checkpoint + rising elapsed only = slow or blocked iteration
+- processed entities rising below total = healthy catch-up
 
-- A stage with growing `elapsed` and flat `entities_processed` suggests a stall (or very slow iteration).
-- A stage with `entities_processed` advancing but far below `entities_total` is in catch-up mode.
+## Common unwind triggers
 
-## Unwind: When It Happens and How to Recognize It
+The pipeline unwind path in `crates/stages/api/src/pipeline/mod.rs` is commonly reached after:
 
-### Why unwind happens
+- validation or execution error from a stage
+- detached-head conditions
+- static-file/data consistency issues
+- explicit operator-triggered unwind
 
-The pipeline decides to unwind on several classes of errors:
+When unwind appears in logs, capture:
 
-1. Validation errors (consensus)
-   - Reported as `StageError::Block { error: Validation(..) }`.
-   - Often indicates an invalid chain segment or a state root mismatch.
-2. Execution errors
-   - Reported as `StageError::Block { error: Execution(..) }`.
-3. Detached head
-   - Reported as `StageError::DetachedHead { .. }`.
-   - Typically a downloader attachment issue: downloaded header can’t be attached to the local head.
-4. Static-file / DB inconsistency
-   - Reported as `StageError::MissingStaticFileData { .. }`.
-   - Indicates the stage expected data in static files but it is missing.
-5. Manual unwind request
-   - Triggered by running the pipeline with `PipelineTarget::Unwind(target)`.
+- stage that triggered it
+- unwind target
+- bad block if present
+- whether pruning prevented the requested target
 
-### What unwind looks like
+## Fast triage order
 
-During unwind, the pipeline:
+1. identify the active stage from `sync::pipeline` logs or `PipelineEvent`
+2. read all stage checkpoints and find the first lagging boundary
+3. if needed, rerun a smaller window with `reth stage run`
+4. if state must be rewound, use `reth stage unwind`
+5. use `reth stage drop` only when you intentionally want destructive repair work
 
-- iterates stages **from last to first**;
-- skips a stage if its checkpoint is already below the unwind target;
-- repeatedly calls `stage.unwind()` until it reaches `unwind_to`;
-- saves stage checkpoints and commits after each unwind iteration.
+## Read next
 
-In logs (target `sync::pipeline`), you typically see:
-
-- “Starting unwind” with `from=<stage_checkpoint> to=<unwind_target>`
-- repeated “Stage unwound” lines with `progress=<new_checkpoint>`
-
-### Safety: pruning can block unwind
-
-Before unwinding, the pipeline checks that the unwind target is still unpruned. If the requested `unwind_to` falls behind pruning checkpoints, the pipeline errors with `PipelineError::UnwindTargetPruned`.
-
-If you see this, the unwind target is incompatible with the node’s current pruning configuration/state.
-
-## Common Failure Modes and Where to Start
-
-### Recoverable vs fatal stage errors
-
-`StageError::is_fatal()` classifies certain errors as fatal (stop the pipeline) vs recoverable (retry the stage by discarding the current transaction and rerunning).
-
-As an operator:
-
-- If you see “non-fatal error … Retrying…”, expect the stage to restart.
-- If you see “fatal error”, expect the pipeline to stop and require intervention.
-
-### MerkleExecute special case
-
-On some validation errors, the pipeline resets `MerkleExecute`’s checkpoint progress bytes (`StageCheckpointProgresses`) and stage checkpoint to avoid restarting the trie stage from an invalid internal position.
-
-If state-root related issues persist:
-
-- focus investigation on `MerkleExecute` and its upstream dependency stages (`Execution`, hashing).
-
-### Static file consistency
-
-The pipeline runs `move_to_static_files()` at the start of each main loop iteration. This:
-
-- copies eligible DB data into static files based on stage checkpoints;
-- runs a pruner pass to remove DB data now backed by static files.
-
-If a stage complains about missing static file data, it is often a symptom of DB/static file divergence; the pipeline may respond by unwinding to restore consistency.
-
-## Practical Triage Checklist
-
-1. Identify the active stage: look for `sync::pipeline` `Prepare`/`Run`/`Ran` logs or pipeline events.
-2. Compare stage checkpoints: determine if the current stage is blocked behind the previous stage.
-3. If unwinding:
-   - find the unwind target (`to=`) and bad block context (`bad_block=`), if present.
-   - verify pruning isn’t preventing the unwind.
-4. If retrying:
-   - look for repeated non-fatal errors; persistent retries usually indicate an external dependency issue (downloader, IO contention) or a reproducible validation error.
-5. Use metrics to decide whether you have “slow progress” vs “no progress”.
-
-## Key Code References
-
-- Pipeline + unwind logic: `crates/stages/api/src/pipeline/mod.rs`
-- Stage trait and input/output types: `crates/stages/api/src/stage.rs`
-- Default stage ordering: `crates/stages/stages/src/sets.rs`
-- Stage IDs: `crates/stages/types/src/id.rs`
-- Stage checkpoints: `crates/stages/types/src/checkpoints.rs`
-- Checkpoint storage traits: `crates/storage/storage-api/src/stage_checkpoint.rs`
-- DB tables (`StageCheckpoints`, `StageCheckpointProgresses`): `crates/storage/db-api/src/tables/mod.rs`
-- Metrics listener: `crates/stages/api/src/metrics/listener.rs`
+- architecture overview: `agent-docs/architecture/staged-sync.md`
+- node startup context: `agent-docs/guides/node-lifecycle.md`
+- repo layout: `docs/repo/layout.md`

@@ -1,256 +1,164 @@
-# P2P Configuration Guide
+# P2P Configuration
 
-This guide focuses on the most common knobs for configuring Reth's devp2p networking: listener ports, discovery (discv4/discv5/DNS), bootnodes and trusted peers, and transaction gossip.
+This guide covers the highest-signal networking knobs for `reth node`.
 
-For implementation details, see `llmdocs/architecture/p2p-networking.md`.
+## Mental model
 
-## Mental Model
+Most operator changes fall into four groups:
 
-There are three layers of configuration that matter most:
+1. listener sockets: where RLPx and discovery bind
+2. discovery: how peers are found
+3. peer policy: which peers are allowed or preferred
+4. gossip and limits: how much traffic the node accepts and propagates
 
-- RLPx listener (TCP): where other peers connect and where you dial out.
-- Discovery (UDP): how you learn about peers (discv4/discv5/DNS).
-- Peer set policy: which peers you prefer/require (trusted peers, bootnodes, peer limits).
+Primary CLI reference: `docs/vocs/docs/pages/cli/reth/node.mdx`.
 
-## Core Ports and Addresses
+## Listener and discovery settings
 
-### RLPx (TCP) listener
+### RLPx listener
 
-- `--addr <IP>`: TCP listen address for RLPx.
-- `--port <PORT>`: TCP listen port for RLPx.
+- `--addr`
+- `--port`
 
-Defaults:
-- Both default to the same values as discv4 defaults (`0.0.0.0:30303` on IPv4).
+These control the TCP socket used for peer sessions.
 
-Notes:
-- RLPx is the protocol that carries `p2p` + `eth/*` messages.
-- Firewalls/NAT must allow inbound TCP if you want inbound peer connections.
+### Discv4
 
-### Discovery v4 (UDP)
+- `--discovery.addr`
+- `--discovery.port`
+- `--disable-discv4-discovery`
 
-- `--discovery.addr <IP>`: UDP listen address for discv4.
-- `--discovery.port <PORT>`: UDP listen port for discv4.
+Discv4 is the default UDP discovery path.
 
-Defaults:
-- `0.0.0.0:30303`.
+### Discv5
 
-Notes:
-- The node record used by discovery includes the RLPx TCP port.
-- If you run multiple instances on one host, you must avoid UDP port conflicts.
+- `--enable-discv5-discovery`
+- `--discovery.v5.addr`
+- `--discovery.v5.addr.ipv6`
+- `--discovery.v5.port`
+- `--discovery.v5.port.ipv6`
+- `--discovery.v5.lookup-interval`
+- `--discovery.v5.bootstrap.lookup-interval`
+- `--discovery.v5.bootstrap.lookup-countdown`
 
-### Discovery v5 (UDP)
+Discv5 is optional. Its advertised address must match the RLPx IP family.
 
-Discv5 is optional and must be explicitly enabled or configured.
+### DNS discovery
 
-Key flags:
+- `--disable-dns-discovery`
+- `--dns-retries`
 
-- `--enable-discv5-discovery`: turn on discv5.
-- `--discovery.v5.addr <IPv4>`: explicit IPv4 UDP address for discv5.
-- `--discovery.v5.addr.ipv6 <IPv6>`: explicit IPv6 UDP address for discv5.
-- `--discovery.v5.port <PORT>`: IPv4 UDP port for discv5.
-- `--discovery.v5.port.ipv6 <PORT>`: IPv6 UDP port for discv5.
-- `--discovery.v5.lookup-interval <SECONDS>`: periodic lookup interval.
-- `--discovery.v5.bootstrap.lookup-interval <SECONDS>` and `--discovery.v5.bootstrap.lookup-countdown <N>`: bootstrap lookup schedule.
-
-Important: the advertised discv5 address is constrained by the RLPx address IP version.
-- If your RLPx address is IPv4, discv5 will use/advertise IPv4; similarly for IPv6.
-
-## Enabling/Disabling Discovery
-
-Reth supports multiple discovery sources. You can disable them independently.
+DNS discovery is only a seed source; active sessions still happen over RLPx.
 
 ### Disable all discovery
 
 - `--disable-discovery`
 
-This disables:
-- discv4
-- discv5
-- DNS discovery
+Use this for controlled topologies where peers are configured explicitly.
 
-Use cases:
-- private or controlled networks
-- Kubernetes/service-discovery environments
-- nodes behind strict NAT/firewalls where discovery traffic is undesirable
+## NAT and advertised reachability
 
-When discovery is disabled, you generally need to provide peers explicitly (trusted/static peers).
-
-### Disable DNS discovery only
-
-- `--disable-dns-discovery`
-
-### Disable discv4 only
-
-- `--disable-discv4-discovery`
-
-### Control NAT behavior
-
-- `--disable-nat`: disables NAT discovery.
-
-There are also NAT resolver modes via:
 - `--nat any|none|upnp|publicip|extip:<IP>`
+- `--disable-nat`
+- `--net-if.experimental <IF_NAME>`
 
-Operational notes:
-- NAT settings affect what external address the node advertises.
-- Some NAT modes can be useful even if discovery is disabled (for example, explicitly advertising a known external IP).
+Use explicit NAT configuration when auto-detection advertises the wrong public address.
 
-## Bootnodes and Trusted Peers
+## Peer set policy
 
 ### Bootnodes
 
-Bootnodes are used as discovery bootstrap seeds.
+- `--bootnodes`
 
-- `--bootnodes <enode://...,...>`: comma-separated list of enode records.
-
-If `--bootnodes` is not set, Reth falls back to chain-spec defaults.
-
-Notes:
-- Bootnodes are discovery inputs; they are not necessarily meant to be long-lived peers.
-- Bootnodes may be DNS names and can be resolved.
+Bootnodes seed discovery. If omitted, Reth falls back to chain-specific defaults.
 
 ### Trusted peers
 
-Trusted peers are explicit peers that you want to connect to and/or accept connections from.
-
-- `--trusted-peers <enode://...,...>`: comma-separated list.
-
-Trusted peers are treated specially:
-- They are prioritized in connection management.
-- They can be granted more leeway in reputation handling.
-- DNS names in trusted peer records can be periodically re-resolved (useful when peer IPs change).
-
-### Trusted-only mode
-
+- `--trusted-peers`
 - `--trusted-only`
 
-Effect:
-- Restricts outbound connections and inbound acceptance to trusted peers.
+Use trusted-only mode for private clusters or tightly controlled peering.
 
-Use cases:
-- private clusters
-- permissioned devp2p networks
-- controlled peering for infrastructure operators
+### Connection limits
 
-## Peer Limits and Persistence
+- `--max-outbound-peers`
+- `--max-inbound-peers`
+- `--max-peers`
+- `--netrestrict`
 
-### Peer count limits
+`--netrestrict` applies an IP allowlist using CIDR ranges.
 
-- `--max-outbound-peers <N>`
-- `--max-inbound-peers <N>`
-- `--max-peers <N>`: total peers with an approximate split (cannot be combined with the two flags above)
+### Fork and block filtering
 
-### Persisting known peers
+- `--enforce-enr-fork-id`
+- `--required-block-hashes`
 
-- `--peers-file <PATH>`: store connected peers on shutdown and reload on startup.
-- `--no-persist-peers`: disable peer persistence (conflicts with `--peers-file`).
+Use these when you need stricter peer admission than normal mainnet-style discovery.
 
-### DNS retries
+## Node identity and peer persistence
 
-- `--dns-retries <N>`: number of DNS resolution retries when peering.
+- `--identity`
+- `--p2p-secret-key`
+- `--p2p-secret-key-hex`
+- `--peers-file`
+- `--no-persist-peers`
 
-## Transaction Gossip Controls
+The secret key determines the node's stable peer identity across discovery and RLPx.
 
-Transaction propagation is part of the P2P stack and can be tuned independently.
-
-### Disable gossip
+## Transaction gossip controls
 
 - `--disable-tx-gossip`
+- `--tx-propagation-policy`
+- `--tx-ingress-policy`
+- `--tx-propagation-mode`
+- `--max-tx-reqs`
+- `--max-tx-reqs-peer`
+- `--max-seen-tx-history`
+- `--max-pending-imports`
+- `--pooled-tx-response-soft-limit`
+- `--pooled-tx-pack-soft-limit`
+- `--max-tx-pending-fetch`
 
-Use cases:
-- private mempool strategy
-- RPC-only nodes
-- minimizing bandwidth for personal nodes
+Practical defaults:
 
-### Propagation and ingress policy
+- personal or RPC-focused node: often disable or limit tx gossip
+- public network participant: keep discovery and tx gossip enabled unless you have a reason not to
+- trusted-only cluster: pair `--disable-discovery` with `--trusted-only` and explicit peers
 
-- `--tx-propagation-policy all|trusted|none`
-  - Which peers are eligible to receive transaction propagation.
-- `--tx-ingress-policy all|trusted|none`
-  - Which peers you accept transaction announcements/transactions from.
+## Common setups
 
-### Propagation mode (how many peers get full payloads)
+### Public default node
 
-- `--tx-propagation-mode sqrt|all|max:<N>`
+Use the default discovery stack plus a reachable TCP/UDP port.
 
-Defaults:
-- `sqrt` (send full txs to roughly sqrt(peers)).
+Typical flags: `reth node --addr 0.0.0.0 --port 30303`.
 
-### Tx request limits (mempool fetching)
+### Private or trusted-only cluster
 
-These control `GetPooledTransactions` concurrency and response sizing:
+Combine:
 
-- `--max-tx-reqs <N>`
-- `--max-tx-reqs-peer <N>`
-- `--max-seen-tx-history <N>`
-- `--max-pending-imports <N>`
-- `--pooled-tx-response-soft-limit <BYTES>`
-- `--pooled-tx-pack-soft-limit <BYTES>`
-- `--max-tx-pending-fetch <N>`
+- `--disable-discovery`
+- `--trusted-only`
+- `--trusted-peers ...`
 
-These are primarily for tuning bandwidth/latency tradeoffs and protecting against overload.
+### Public node with explicit external IP
 
-## Network Restriction (IP Allowlist)
+If NAT auto-detection is wrong, set `--nat extip:<IP>`.
 
-- `--netrestrict "CIDR1,CIDR2"`
+### More selective peer admission
 
-Example:
-- `--netrestrict "10.0.0.0/8,192.168.0.0/16"`
+Add:
 
-Effect:
-- Only peers whose IPs fall within the given CIDR ranges are allowed.
+- `--enforce-enr-fork-id`
+- `--required-block-hashes ...`
+- optionally `--netrestrict ...`
 
-## Node Identity / Key Material
+## When to read source
 
-The node's devp2p identity is derived from a secp256k1 secret key.
+Use these paths when CLI behavior and runtime behavior disagree:
 
-- `--p2p-secret-key <PATH>`: load secret key from a file.
-- `--p2p-secret-key-hex <HEX>`: provide a hex-encoded key.
-- `--identity <STRING>`: sets the client string advertised during handshake.
-
-Operational notes:
-- Keeping the same key preserves the same peer ID across restarts.
-- Discv4 and discv5 use the same key material for identity, so one key ties together the advertised identity across discovery versions.
-
-## Common Recipes
-
-### 1) Default public node (mainnet)
-
-```bash
-reth node \
-  --addr 0.0.0.0 \
-  --port 30303
-```
-
-### 2) Disable discovery and connect only to trusted peers
-
-```bash
-reth node \
-  --disable-discovery \
-  --trusted-only \
-  --trusted-peers "enode://<pk>@<host>:30303" \
-  --addr 0.0.0.0 \
-  --port 30303
-```
-
-### 3) Use custom bootnodes and enable discv5
-
-```bash
-reth node \
-  --bootnodes "enode://<pk1>@<host1>:30303,enode://<pk2>@<host2>:30303" \
-  --enable-discv5-discovery
-```
-
-### 4) Provider-style node: keep P2P but disable tx gossip
-
-```bash
-reth node \
-  --disable-tx-gossip
-```
-
-## Where These Flags Live
-
-CLI parsing for most of these options is defined in:
-
-- `crates/node/core/src/args/network.rs` (`NetworkArgs` and `DiscoveryArgs`)
-
-Network runtime wiring consumes these to build a `reth_network::NetworkConfigBuilder` and then a `NetworkManager`.
+- `crates/net/network/src/config.rs`
+- `crates/net/network/src/discovery.rs`
+- `crates/net/network/src/manager.rs`
+- `crates/net/network/src/transactions/mod.rs`
+- `docs/vocs/docs/pages/cli/reth/node.mdx`

@@ -1,216 +1,127 @@
-# Storage & Providers
+# Storage and Providers
 
-This document describes how Reth stores chain/state data (MDBX + static files) and how the rest of the codebase accesses it through provider abstractions.
+Reth splits storage into provider-facing layers so RPC, sync, engine, and pruning code do not talk to MDBX or static-file internals directly.
 
-Relevant scout context: `llmdocs/agent/scout-sync-storage.md`.
+## Storage surfaces
 
-## Overview
+- `MDBX`: primary transactional store for canonical mappings, plain state, trie data, metadata, and checkpoints.
+- `Static files`: append-only `NippyJar` segments for large historical data in `crates/static-file/*`.
+- `RocksDB`: auxiliary store used by storage v2 for selected history indices.
 
-Reth’s storage is intentionally split:
+## Storage settings
 
-- `MDBX` (via `reth-db` / `reth-db-api`) stores mutable state, indices, checkpoints, and everything that benefits from point lookups and transactional updates.
-- `Static files` (via `reth-static-file`, `reth-provider::providers::StaticFileProvider`) store large, append-only historical data segments as `NippyJar` files on disk.
-- Some optional data can also be offloaded to `RocksDB` (through `reth-provider::providers::RocksDBProvider`) and is committed together with MDBX/static-files at provider commit time.
+`crates/storage/db-api/src/models/metadata.rs` defines `StorageSettings`.
 
-The provider layer (`reth-provider`, `reth-storage-api`) is the main API boundary: higher layers (RPC, staged sync, engine, pruning, etc.) generally do not talk to MDBX cursors or static-file jars directly.
+- `storage_v2 = false`: legacy layout; everything stays in MDBX.
+- `storage_v2 = true`: default base layout; moves receipts, senders, account/storage changesets into static files and routes account/storage/tx-hash history into RocksDB.
 
-## Storage Model: What Lives Where
+`crates/storage/db-common/src/init.rs` writes storage settings during genesis/init and caches them on the provider factory.
 
-### MDBX (primary KV database)
+## Static-file segments
 
-MDBX is the canonical transactional store. It contains, broadly:
+`crates/static-file/types/src/segment.rs` defines six segments:
 
-- Chain indices and canonical mapping data (block hash/number lookups, body indices, etc.).
-- Execution/state tables:
-  - Plain state: account and storage key/value state (for “latest” state queries).
-  - Changesets and history indices used to reconstruct historical state.
-  - Trie data (hashed state/trie nodes) used for state root/proof computation.
-- Sync/bookkeeping metadata:
-  - Stage checkpoints (`StageCheckpoints`) and other pipeline progress records.
-  - Prune checkpoints (per prune segment) and storage settings metadata.
+- `Headers`
+- `Transactions`
+- `Receipts`
+- `TransactionSenders`
+- `AccountChangeSets`
+- `StorageChangeSets`
 
-MDBX tables are typed in `reth-db-api` (see `Tables` and `tables::*`). Consumers interact through `DbTx`/`DbTxMut` and cursor traits, but most code uses the provider traits instead.
+`crates/static-file/static-file/src/static_file_producer.rs` moves eligible data from transactional storage into these append-only ranges.
 
-### Static files (NippyJar; immutable segments)
+## Provider boundary
 
-Static files are a second storage surface optimized for large historical data and sequential/ranged reads. They are organized by segment (`reth_static_file_types::StaticFileSegment`), each stored as a series of `NippyJar` files covering an expected block range.
+`crates/storage/storage-api/src/lib.rs` and `crates/storage/storage-api/src/state.rs` define the read/write traits used by higher layers.
 
-Segments currently include:
+Common trait groups:
 
-- `Headers`: moved from MDBX tables `CanonicalHeaders`, `Headers`, `HeaderTerminalDifficulties`.
-- `Transactions`: moved from MDBX `Transactions`.
-- `Receipts`: moved from MDBX `Receipts`.
-- `TransactionSenders`: moved from MDBX `TransactionSenders`.
-- `AccountChangeSets`: moved from MDBX `AccountChangeSets` (stored “block-by-block changesets sorted by address”).
+- chain data: `HeaderProvider`, `BlockReader`, `TransactionsProvider`, `ReceiptProvider`
+- state: `StateProvider`, `StateProviderFactory`
+- metadata/checkpoints: `MetadataProvider`, `StageCheckpointReader`, `PruneCheckpointReader`
+- writes: `HistoryWriter`, `MetadataWriter`
 
-Static files are append-only and become queryable only after the writer commits and the provider index is updated. A read-only `StaticFileProvider` can optionally watch the directory for changes (recommended when reading while a node is actively writing).
+## Main implementation types
 
-### Optional RocksDB (auxiliary)
+### `ProviderFactory`
 
-Reth includes an optional RocksDB-backed storage area and “either” readers/writers (`EitherReader`, `EitherWriter`) that select MDBX vs RocksDB depending on storage settings. Importantly:
+`crates/storage/provider/src/providers/database/mod.rs`
 
-- Batches written via `EitherWriter` are intended to become visible only when the enclosing provider commits (see invariants tested in `crates/storage/provider/src/either_writer.rs`).
-- RocksDB batches are queued on the `DatabaseProvider` and committed as part of the provider’s commit path.
+Primary entrypoint for local storage access.
 
-## Provider Abstractions
+- opens RO providers with `provider()`
+- opens RW providers with `provider_rw()`
+- opens unwind-aware RW providers with `unwind_provider_rw()`
+- returns `latest()` and `history_by_block_number/hash()` state providers
+- owns cached `StorageSettings`, `StaticFileProvider`, and `RocksDBProvider`
 
-### Trait boundary: `reth-storage-api`
+### `DatabaseProvider`
 
-`reth-storage-api` defines the “what can I read/write?” surface that higher layers depend on. Examples:
+`crates/storage/provider/src/providers/database/provider.rs`
 
-- Chain data: `HeaderProvider`, `BlockReader`, `TransactionsProvider`, `ReceiptProvider`, `BlockBodyIndicesProvider`, `BlockHashReader`, `BlockNumReader`.
-- State: `StateProvider` (account/storage/bytecode + proofs/roots depending on composition).
-- Bookkeeping: `StageCheckpointReader/Writer`, `PruneCheckpointReader/Writer`, `MetadataProvider/Writer`.
-- The transaction wrapper boundary: `DBProvider` (holds a `DbTx` and defines `commit`).
+Transactional wrapper over:
 
-Concrete implementations live in `reth-provider`.
+- one MDBX transaction
+- shared static-file provider
+- shared RocksDB provider
+- prune modes and storage settings cache
 
-### `ProviderFactory`: the main entry point
+This is the type that implements most storage traits.
 
-`reth-provider::providers::ProviderFactory` is the typical “handle” passed around by node components.
+### State providers
 
-It owns or references:
+`crates/storage/provider/src/providers/state/latest.rs`
+`crates/storage/provider/src/providers/state/historical.rs`
 
-- The MDBX environment (`db: N::DB`).
-- `chain_spec: Arc<ChainSpec>`.
-- A `StaticFileProvider` instance.
-- Pruning configuration (`PruneModes`).
-- Storage settings cache (`StorageSettingsCache`) loaded at init and shared by all providers created by the factory.
-- A RocksDB provider and a trie changeset cache handle.
+- `LatestStateProvider*`: reads current plain or hashed canonical state.
+- `HistoricalStateProvider*`: reconstructs state at a block boundary using history indices and changesets.
 
-Key methods/patterns:
+`crates/storage/storage-api/src/state.rs` documents the key rule: state providers are inclusive to the end of their target block, so replaying block `n` usually needs parent state `n - 1`.
 
-- `provider()` opens a new read-only MDBX transaction and returns a `DatabaseProviderRO`.
-- `provider_rw()` opens a new read-write MDBX transaction and returns a `DatabaseProviderRW` wrapper.
-- Convenience state entrypoints:
-  - `latest()` returns a boxed latest state provider.
-  - `history_by_block_number(number)` and `history_by_block_hash(hash)` return boxed historical state providers.
+## Historical-state model
 
-The factory also implements many read traits itself by internally opening a transaction (see the many `impl ... for ProviderFactory` blocks in `crates/storage/provider/src/providers/database/mod.rs`). This is convenient, but be conscious of transaction lifetime and cost.
+Historical reads depend on three inputs:
 
-### `DatabaseProvider`: transactional provider over MDBX + static files
+- history indices (`AccountsHistory`, `StoragesHistory`; in storage v2 these can live in RocksDB)
+- change sets (`AccountChangeSets`, `StorageChangeSets`)
+- current plain/hashed state
 
-`reth-provider::providers::DatabaseProvider<TX, N>` is the core transactional provider. It wraps:
+`crates/storage/provider/src/providers/database/provider.rs` adds prune-aware lower bounds before constructing historical providers. Once account or storage history is pruned past a block, reads below that boundary fail instead of silently returning partial state.
 
-- An MDBX transaction (`TX: DbTx` / `DbTxMut`).
-- The `StaticFileProvider` used to read (and, in RW mode, to write) static-file segments.
-- Prune modes, storage settings cache, RocksDB provider, changeset cache, etc.
+## Commit and consistency model
 
-It implements `DBProvider` and most chain/state traits.
+`ProviderFactory::provider_rw()` returns a provider whose `commit()` is the visibility boundary.
 
-RO/RW variants:
+Normal write path coordinates:
 
-- `DatabaseProviderRO<DB, N> = DatabaseProvider<<DB as Database>::TX, N>`
-- `DatabaseProviderRW<DB, N>` is a wrapper around `DatabaseProvider<<DB as Database>::TXMut, N>` (wrapper exists due to a Rust type alias limitation).
+1. static-file finalization
+2. pending RocksDB batch commit
+3. MDBX commit
 
-### `StaticFileProvider`: jar/index manager + writers
+Unwind writes use a different order through `unwind_provider_rw()` so restart recovery can truncate static files from checkpoints.
 
-`reth-provider::providers::StaticFileProvider` manages:
+`ProviderFactory::assert_consistent()` checks MDBX, RocksDB, and static-file alignment and can force unwind when the stores disagree.
 
-- The directory of `.jar` files (one set per segment and expected range).
-- An in-memory index mapping segments to available ranges and (for tx-based segments) transaction number ranges.
-- Optional directory watching for read-only instances.
-- A set of lazily-created segment writers for RW access.
+## Pruning integration
 
-Write flow uses `StaticFileProviderRW` handles obtained via:
+`crates/prune/prune/src/builder.rs` and `crates/prune/prune/src/pruner.rs` build prune jobs around the same provider traits.
 
-- `get_writer(block, segment)` or
-- `latest_writer(segment)`
+Pruning tracks progress with `PruneCheckpoint` from `crates/prune/types/src/checkpoint.rs`.
 
-Writer lifecycle and visibility:
+Effects:
 
-- `commit()` persists offsets/header configuration to disk and updates the provider’s index.
-- `finalize()` is used when no prune is queued; it ensures fsync (`sync_all`) if needed and updates indices.
+- history below the prune checkpoint is no longer queryable through historical state providers
+- prune segments use static-file and RocksDB-aware readers/writers, not raw tables
 
-### State providers: latest, historical, overlay
+## Retrieval map
 
-Reth intentionally models “state at which point?” as a provider choice.
-
-Latest state:
-
-- `LatestStateProviderRef` reads from plain state tables:
-  - `PlainAccountState`, `PlainStorageState`, `Bytecodes`, plus block-hash lookups for canonical hash queries.
-- It also supports computing state roots and proofs using trie overlay algorithms, based on a `HashedPostState` derived from an execution bundle.
-
-Historical state:
-
-- `HistoricalStateProviderRef` reconstructs state for a given block boundary using:
-  - `AccountsHistory`, `StoragesHistory`
-  - `AccountChangeSets`, `StorageChangeSets`
-  - `Bytecodes`
-- It represents history lookup outcomes via `HistoryInfo` (`NotYetWritten`, `InChangeset`, `InPlainState`, `MaybeInPlainState`) to decide where to fetch the value.
-- Pruning boundaries are enforced: if the requested block is older than the lowest available history block for the relevant segment, it errors with `StateAtBlockPruned`.
-
-Overlay state:
-
-- `OverlayStateProviderFactory` builds an `OverlayStateProvider` that can:
-  - revert database state to a target block (collecting reverts from changesets), and
-  - apply additional overlays (either immediately provided or lazily computed via `reth_chain_state::LazyOverlay`).
-- This is used heavily by engine/payload validation paths where “DB tip state + in-memory executed blocks” must be combined into a coherent view.
-
-### `BlockchainProvider` and consistent snapshots
-
-`reth-provider::providers::BlockchainProvider` wraps a `ProviderFactory` and a `CanonicalInMemoryState`.
-
-To serve RPC/engine safely, it frequently materializes a `ConsistentProvider`:
-
-- `ConsistentProvider` takes a snapshot of in-memory head state first, then opens an MDBX read-only transaction.
-- The order matters: taking the DB transaction first could race with in-memory flushing blocks to disk, creating gaps that neither in-memory nor the older DB view can satisfy.
-
-Caution from the code:
-
-- Avoid holding `ConsistentProvider` too long; long-lived read transactions can time out.
-
-## Transaction Boundaries, Commit Patterns, and Invariants
-
-### RO vs RW transactions
-
-- RO (`DbTx`) transactions are used for queries and should be short-lived.
-- RW (`DbTxMut`) transactions are used by stages, pruning, and any writes.
-
-There is explicit support for disabling long read transaction safety on a provider (`DBProvider::disable_long_read_transaction_safety`), but only do this when you are sure no concurrent writes exist (node offline), otherwise MDBX freelist growth can become problematic.
-
-### Provider commit semantics
-
-The critical atomic boundary for “storage writes become visible” is `DBProvider::commit` on a RW provider.
-
-For `DatabaseProvider` the commit procedure is intentionally ordered to keep MDBX/static-file consistency manageable across crashes and unwinds.
-
-Normal path (no unwind queued):
-
-- Finalize static file writers (`static_file_provider.finalize()`), which syncs/commits writer configuration and updates the index.
-- Commit any queued RocksDB batches (if enabled).
-- Commit the MDBX transaction (`tx.commit()`).
-
-Unwind path (static-file unwind queued):
-
-- Commit the MDBX transaction first.
-- Commit queued RocksDB batches.
-- Commit static files via `static_file_provider.commit()`.
-
-Rationale (from `DatabaseProvider::commit`): when unwinding, committing the DB first makes interruption recovery easier; on restart, static files can be truncated according to checkpoints.
-
-### Static-file visibility rules
-
-Static files are not treated like a transactional database. Instead:
-
-- Data is appended/updated in per-segment writers.
-- Until the writer is committed/finalized and the index updated, queries should not “see” the new data.
-- Read-only providers can watch the directory to observe new static files written by a running node.
-
-### Crash safety and consistency
-
-Because MDBX and static files are separate persistence domains, Reth must ensure they stay aligned:
-
-- Staged sync checkpoints and static-file “highest ranges” are used to detect gaps.
-- Startup consistency checks can detect “MDBX says data exists but static files missing” (or the reverse) and repair by unwinding/replaying.
-
-The high-level risk and mitigation is summarized in `llmdocs/agent/scout-sync-storage.md`.
-
-## Practical Mapping: “Which provider for which job?”
-
-- Fast chain history reads over large ranges (headers/txs/receipts): prefer the provider traits that can read from static files when present.
-- State at tip for RPC, txpool validation, and execution: `LatestStateProvider*`.
-- State at historical block: `HistoricalStateProvider*` (subject to pruning).
-- State for “DB + in-memory overlay” (engine/payload validation): `OverlayStateProviderFactory` or `BlockchainProvider`’s consistent provider + memory overlay providers.
-
+- storage traits: `crates/storage/storage-api/src/lib.rs`
+- state traits: `crates/storage/storage-api/src/state.rs`
+- storage settings: `crates/storage/db-api/src/models/metadata.rs`
+- init/genesis wiring: `crates/storage/db-common/src/init.rs`
+- provider factory: `crates/storage/provider/src/providers/database/mod.rs`
+- transactional provider: `crates/storage/provider/src/providers/database/provider.rs`
+- latest/historical state: `crates/storage/provider/src/providers/state/`
+- static-file segments: `crates/static-file/types/src/segment.rs`
+- static-file producer: `crates/static-file/static-file/src/static_file_producer.rs`
+- pruner: `crates/prune/prune/src/`

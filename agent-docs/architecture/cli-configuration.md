@@ -1,238 +1,108 @@
 # CLI & Configuration
 
-This document describes how Reth's CLI is structured, where configuration is defined, and how configuration is layered (defaults -> `reth.toml` / `reth_config` -> CLI flags).
+## Purpose
 
-## CLI Entry Points
+Reth splits configuration into two surfaces:
 
-### Main binary (`reth`)
+1. CLI/runtime args aggregated in `crates/node/core/src/node_config.rs`
+2. TOML config persisted as `reth_config::Config` in `crates/config/src/config.rs`
 
-- Entry point: `bin/reth/src/main.rs`
-- Parsing: `clap::Parser` is used to parse the top-level CLI.
-- Execution: the binary calls the generic CLI runner:
+Use the CLI for startup-only and operator-local overrides. Use `reth.toml` for durable node settings that should survive restarts.
 
-```rust
-Cli::<EthereumChainSpecParser, RessArgs>::parse().run(...)
-```
+## Main entry path
 
-The closure passed to `run()` receives a `WithLaunchContext<NodeBuilder<...>>` and the extra args type (`RessArgs` in the main binary).
+- `bin/reth/src/main.rs` starts the CLI.
+- `crates/cli/commands/src/node.rs` parses `reth node` options into `NodeConfig`.
+- `crates/node/builder/src/launch/common.rs` loads `reth.toml`, merges selected CLI state, and attaches both configs to launch.
 
-### Top-level `Cli` type
+## CLI grouping model
 
-- Defined in: `crates/ethereum/cli/src/interface.rs`
-- Type: `pub struct Cli<C, Ext, Rpc, SubCmd>`
+`NodeConfig` is the top-level runtime config object.
 
-Key points:
+High-signal groups:
 
-- `Cli` is generic so downstream binaries/examples can:
-  - swap chain spec parser (`C: ChainSpecParser`)
-  - add extra args (`Ext: clap::Args`)
-  - validate allowed RPC modules (`Rpc: RpcModuleValidator`)
-  - add custom subcommands (`SubCmd: Subcommand`)
+- datadir and storage paths: `crates/node/core/src/args/datadir_args.rs`
+- chain + config file selection: `crates/cli/commands/src/common.rs`
+- networking and discovery: `crates/node/core/src/args/network.rs`
+- public/auth RPC: `crates/node/core/src/args/rpc_server.rs`
+- txpool: `crates/node/core/src/args/txpool.rs`
+- payload builder: `crates/node/core/src/args/payload_builder.rs`
+- database: `crates/node/core/src/args/database.rs`
+- pruning: `crates/node/core/src/args/pruning.rs`
+- engine execution/cache knobs: `crates/node/core/src/args/engine.rs`
+- storage layout: `crates/node/core/src/args/storage.rs`
+- metrics/logging/tracing: `metric.rs`, `log.rs`, `trace.rs`
+- debug/dev/testnet switches: `debug.rs`, `dev.rs`
 
-`Cli` also owns cross-cutting instrumentation:
+## TOML config model
 
-- logging: `logs: LogArgs`
-- tracing: `traces: TraceArgs`
+`reth_config::Config` is much narrower than the full CLI. It persists:
 
-### Command structure (`Commands`)
+- `stages`: sync-stage thresholds and ETL/ERA settings
+- `prune`: pruning modes and minimum distance
+- `peers`: peer/discovery config persisted in TOML
+- `sessions`: peer session config
+- `static_files`: static-file segment sizing
 
-- Defined in: `crates/ethereum/cli/src/interface.rs`
-- Type: `pub enum Commands<C, Ext, SubCmd>`
+Important consequence: many operator knobs are CLI-only, including most RPC, logging, metrics, txpool, builder, engine, and database settings.
 
-Common subcommands include:
+## Config path and datadir
 
-- `reth node`: start a node
-- `reth init`: initialize DB from genesis
-- `reth init-state`: initialize DB from a state dump
-- `reth import` / `reth import-era` / `reth export-era`
-- `reth db`: DB debugging utilities
-- `reth stage`: manipulate staged sync stages
-- `reth p2p`: P2P debugging utilities
-- `reth download`: download public snapshots
-- `reth prune`: prune according to configuration
-- `reth re-execute`: re-execute blocks for verification
-- `reth config`: print config (`reth_config::Config`) as TOML
+Default config resolution:
 
-## Node Command -> NodeConfig
+- `--config <FILE>` if passed
+- otherwise `<datadir>/<chain>/reth.toml`
 
-The `node` subcommand parses a large set of flags and translates them into a single aggregate configuration type:
+Relevant path builders:
 
-- Node command implementation: `crates/cli/commands/src/node.rs`
-- Aggregated config type: `crates/node/core/src/node_config.rs` (`pub struct NodeConfig<ChainSpec>`)
+- `crates/node/core/src/args/datadir_args.rs`
+- `crates/node/core/src/dirs.rs`
 
-`NodeConfig` contains the major CLI argument groups:
+Common derived paths under the chain-scoped datadir:
 
-- `datadir: DatadirArgs` (`crates/node/core/src/args/datadir_args.rs`)
-- `network: NetworkArgs` (`crates/node/core/src/args/network.rs`)
-- `rpc: RpcServerArgs` (`crates/node/core/src/args/rpc_server.rs`)
-- `txpool: TxPoolArgs`
-- `db: DatabaseArgs`
-- `pruning: PruningArgs`
-- `engine: EngineArgs`
-- plus metrics, dev/debug flags, static-files options, etc.
+- `db/`
+- `static_files/`
+- `rocksdb/`
+- `reth.toml`
+- `jwt.hex`
+- peer/discovery persistence files
 
-The node command then constructs a `NodeBuilder`:
+## Precedence and merge rules
 
-- `NodeBuilder::new(node_config)`
-- attaches DB and launch context
+Effective order is:
 
-(See `crates/cli/commands/src/node.rs` around `NodeBuilder::new(node_config)`.)
+1. Rust/clap defaults
+2. loaded `reth.toml`
+3. CLI overrides and merges
 
-## Configuration Layering and Precedence
+Observed merge points in `crates/node/builder/src/launch/common.rs`:
 
-Reth's configuration comes from multiple layers.
+- `network.trusted_only` overwrites `toml_config.peers.trusted_nodes_only`
+- static-file CLI args merge into `toml_config.static_files`
+- pruning may be migrated and saved back to `reth.toml`
 
-### 1) Built-in defaults (Rust defaults)
+`Config::from_path` creates a default TOML file when the target file does not exist.
 
-Most CLI argument structs implement `Default` and/or use `#[arg(default_value_t = ...)]`.
+## Operational mechanics worth remembering
 
-Examples:
+### Instance mode
 
-- `DatadirArgs` defaults to an OS-specific base path.
-- `RpcServerArgs` has global defaults via `DefaultRpcServerArgs` (see below).
-- `NetworkArgs` defaults ports and other behavior.
+`NodeConfig::adjust_instance_ports` offsets discovery, auth RPC, HTTP RPC, WS RPC, and IPC names for `--instance <N>`. Use this for multiple nodes on one host.
 
-### 2) `reth.toml` / `reth_config::Config`
+### Unused ports mode
 
-Reth loads a TOML configuration file into `reth_config::Config`.
+`--with-unused-ports` sets network and RPC ports to `0` so the OS picks free ports. This is mainly for tests and ephemeral local runs.
 
-- TOML path resolution happens in the launcher:
-  - file: `crates/node/builder/src/launch/common.rs`
-  - function: `LaunchContext::load_toml_config`
+### Storage layout selection
 
-The effective config path is:
+`--storage.v2` only affects new databases. Existing databases keep the persisted storage layout from metadata.
 
-- `--config <FILE>` if provided
-- else `<datadir>/<chain>/reth.toml` via `data_dir.config()`
+## Best files to read next
 
-The chain-specific config path helper lives in:
-
-- `crates/node/core/src/dirs.rs` (`ChainPath::config()` returns `<DIR>/<CHAIN_ID>/reth.toml`)
-
-Reth will also mutate/save parts of the TOML config on startup in some cases (notably pruning migrations):
-
-- `LaunchContext::save_pruning_config` migrates deprecated prune settings and may write updates back via `reth_config.save(...)`.
-
-### 3) CLI flags override
-
-The node CLI flags are captured into `NodeConfig` and then used to override or merge parts of the loaded `reth_config::Config`.
-
-Concrete examples in `LaunchContext::load_toml_config` (`crates/node/builder/src/launch/common.rs`):
-
-- `toml_config.peers.trusted_nodes_only = config.network.trusted_only;`
-- `toml_config.static_files = config.static_files.merge_with_config(toml_config.static_files, config.pruning.minimal);`
-
-In other words, configuration precedence is generally:
-
-- defaults
-- config file (`reth.toml`) if present
-- CLI flags take priority where a merge/override exists
-
-Note: not every CLI flag necessarily has a corresponding `reth.toml` key; some configuration remains purely CLI-driven (especially "operational" settings).
-
-## Datadir and Derived Paths
-
-### Datadir CLI args
-
-- Defined in: `crates/node/core/src/args/datadir_args.rs`
-
-Key flags:
-
-- `--datadir <DATA_DIR>`: base path for all reth data
-- `--datadir.static-files <PATH>`: override static files location
-- `--datadir.rocksdb <PATH>`: override RocksDB directory
-- `--datadir.pprof-dumps <PATH>`: override pprof output directory
-
-### Chain-specific datadir resolution
-
-`DatadirArgs::resolve_datadir(chain)` produces a `ChainPath<DataDirPath>`.
-
-Important derived locations (from `crates/node/core/src/dirs.rs`):
-
-- DB: `<DIR>/<CHAIN_ID>/db`
-- Config: `<DIR>/<CHAIN_ID>/reth.toml`
-- Engine API JWT: `<DIR>/<CHAIN_ID>/jwt.hex`
-- Discovery secret: `<DIR>/<CHAIN_ID>/discovery-secret`
-- Known peers: `<DIR>/<CHAIN_ID>/known-peers.json`
-
-## Network Arguments
-
-- Defined in: `crates/node/core/src/args/network.rs` (`pub struct NetworkArgs`)
-
-This is the primary home for P2P settings. Highlights:
-
-- `--bootnodes <enode,...>`: override discovery bootnodes
-- `--trusted-peers <enode,...>` / `--trusted-only`: restrict peering
-- `--addr` / `--port`: P2P listener address/port
-- `--network-id`: override P2P network ID (if needed)
-- `--nat`: NAT resolution mode
-- peer persistence: `--peers-file` or `--no-persist-peers`
-
-## RPC Arguments
-
-- Defined in: `crates/node/core/src/args/rpc_server.rs` (`pub struct RpcServerArgs`)
-
-This is the primary home for user-facing JSON-RPC and Engine API settings.
-
-### HTTP / WS / IPC
-
-- `--http`, `--http.addr`, `--http.port`, `--http.api`, `--http.corsdomain`
-- `--ws`, `--ws.addr`, `--ws.port`, `--ws.api`, `--ws.origins`
-- IPC: `--ipcdisable`, `--ipcpath`, `--ipc.permissions`
-
-### Engine API (authenticated)
-
-- `--authrpc.addr`, `--authrpc.port`
-- `--authrpc.jwtsecret <PATH>`
-  - if unset, a JWT secret may be generated and stored under `<datadir>/<chain>/jwt.hex`
-- `--disable-auth-server` / `--disable-engine-api`
-
-### RPC limits and tuning
-
-Examples of common server tuning flags:
-
-- `--rpc.max-request-size`, `--rpc.max-response-size`
-- `--rpc.max-connections`
-- `--rpc.max-tracing-requests`
-- `--rpc.gascap`, `--rpc.evm-memory-limit`, `--rpc.txfeecap`
-
-### Global RPC defaults
-
-`RpcServerArgs` references a global defaults container:
-
-- `DefaultRpcServerArgs` stored in a `OnceLock` (`crates/node/core/src/args/rpc_server.rs`).
-
-This allows setting defaults centrally (useful for embedding or alternate binaries) before parsing CLI.
-
-## Introspection: `reth config`
-
-The `reth config` subcommand prints TOML for a `reth_config::Config`.
-
-- implementation: `crates/cli/commands/src/config_cmd.rs`
-
-Usage patterns:
-
-- `reth config --default` prints the default config.
-- `reth config --config <path/to/reth.toml>` prints a specific config file.
-
-This is separate from the `NodeConfig` (CLI args) type: `reth config` is about the TOML-backed configuration model.
-
-## Instance Mode (Port Offsets)
-
-`NodeConfig` supports an `--instance <N>` option to adjust multiple ports for running multiple nodes on one machine.
-
-- documented in `crates/node/core/src/node_config.rs` (`instance` field docstring)
-- tests demonstrating behavior exist in `crates/cli/commands/src/node.rs`
-
-Ports affected include discovery, authrpc, http rpc, ws rpc, and ipc path.
-
-## Related Code References
-
-- Binary entry: `bin/reth/src/main.rs`
-- CLI definition: `crates/ethereum/cli/src/interface.rs`
-- NodeConfig aggregation: `crates/node/core/src/node_config.rs`
-- Config loading/merging: `crates/node/builder/src/launch/common.rs`
-- Datadir + derived paths: `crates/node/core/src/args/datadir_args.rs`, `crates/node/core/src/dirs.rs`
-- RPC args: `crates/node/core/src/args/rpc_server.rs`
-- Network args: `crates/node/core/src/args/network.rs`
-- `reth config` command: `crates/cli/commands/src/config_cmd.rs`
+- CLI command assembly: `crates/cli/commands/src/node.rs`
+- common env/config loading: `crates/cli/commands/src/common.rs`
+- aggregate config type: `crates/node/core/src/node_config.rs`
+- TOML config type: `crates/config/src/config.rs`
+- launch-time merge logic: `crates/node/builder/src/launch/common.rs`
+- generated CLI reference: `docs/vocs/docs/pages/cli/reth/node.mdx`
+- operator-oriented config page: `docs/vocs/docs/pages/run/configuration.mdx`

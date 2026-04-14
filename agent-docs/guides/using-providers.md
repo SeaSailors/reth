@@ -1,194 +1,139 @@
 # Using Providers
 
-This guide shows how to obtain and use Reth providers in code, and outlines the common query patterns used by RPC, sync, and engine/payload validation.
+Use provider traits for reads and writes. Treat raw MDBX, static-file, and RocksDB internals as implementation details unless you are already inside storage code.
 
-Primary APIs:
+## Pick the right entrypoint
 
-- `reth-provider` (implementations)
-- `reth-storage-api` (traits)
+### Local storage access
 
-## Getting a ProviderFactory
+Use `ProviderFactory` from `crates/storage/provider/src/providers/database/mod.rs`.
 
-### In a running node
+Common choices:
 
-Most node components already hold a `ProviderFactory` (often named `provider_factory`). Use it directly.
+- `provider()`: short-lived read-only transactional access
+- `provider_rw()`: read-write transactional access
+- `unwind_provider_rw()`: write path for unwind/recovery logic
+- `latest()`: latest canonical state provider
+- `history_by_block_number()` / `history_by_block_hash()`: historical state provider
 
-`ProviderFactory` is cheap to clone (it holds `Arc`-backed handles), and you should prefer passing/cloning the factory rather than holding long-lived MDBX transactions.
+### External read-only tooling
 
-### Open a read-only ProviderFactory from a datadir
+Use `ProviderFactoryBuilder::open_read_only()` in `crates/storage/provider/src/providers/database/builder.rs`.
 
-Use the builder. This is the standard entrypoint for tooling that wants to read an existing node’s data.
+Important options in `ReadOnlyConfig`:
 
-```rust
-use reth_provider::providers::{ProviderFactoryBuilder, ReadOnlyConfig};
-use reth_chainspec::MAINNET;
+- `from_datadir(...)`: assumes `db`, `static_files`, and `rocksdb` sibling directories
+- default watch mode: best when a live node may append new static files
+- `no_watch()`: best when the datadir is offline and stable
+- `disable_long_read_transaction_safety()`: only safe when no concurrent writes exist
 
-// N is a node types adapter that selects primitives + db types.
-// In node code this is usually provided already.
-fn open_ro<N: reth_provider::providers::NodeTypesForProvider<ChainSpec = reth_chainspec::ChainSpec>>() {
-    let factory = ProviderFactoryBuilder::<N>::default()
-        .open_read_only(
-            MAINNET.clone(),
-            ReadOnlyConfig::from_datadir("/path/to/datadir")
-                // Recommended when the directory is actively being written by a running node.
-                // Call `.no_watch()` when you know the directory is static.
-        )
-        .unwrap();
+## Query patterns
 
-    let _ = factory;
-}
-```
+### Chain data
 
-Datadir layout assumed by `ReadOnlyConfig::from_datadir`:
+Use provider traits from `reth-storage-api`.
 
-```text
-datadir/
-  db/
-  rocksdb/
-  static_files/
-```
+Typical trait families:
 
-Notes:
+- headers and numbers: `HeaderProvider`, `BlockHashReader`, `BlockNumReader`
+- blocks and bodies: `BlockReader`, `BlockBodyIndicesProvider`
+- transactions and receipts: `TransactionsProvider`, `ReceiptProvider`
+- metadata and checkpoints: `MetadataProvider`, `StageCheckpointReader`, `PruneCheckpointReader`
 
-- Watching the `static_files/` directory is recommended if you are reading from a live node; otherwise you may not observe newly written static-file segments.
-- If you are sure the database is not being written to, you can disable long read transaction safety (see below) for some use cases.
-
-## Opening providers: RO vs RW
-
-### Read-only transactional provider
-
-Open a short-lived RO provider for a batch of queries:
-
-```rust
-let provider = provider_factory.provider()?;
-
-// Now call any of the provider traits implemented by DatabaseProvider.
-let header = provider.header_by_number(123)?.expect("exists");
-let block = provider.block(123.into())?;
-```
-
-Guideline: do not hold `provider` across `.await` points in async code. Acquire, query, drop.
-
-### Read-write transactional provider
-
-Use `provider_rw()` when you need to write. You must call `commit()` to persist and make changes visible.
-
-```rust
-let provider_rw = provider_factory.provider_rw()?;
-
-// ... write via BlockWriter/StateWriter/etc ...
-
-provider_rw.commit()?;
-```
-
-`commit()` is the atomic boundary for:
-
-- MDBX transaction commit
-- static file finalization/commit (when writing segments)
-- queued RocksDB batch commits (when enabled)
-
-## Accessing chain data (headers, blocks, txs, receipts)
-
-Most chain data queries are expressed via `reth-storage-api` traits implemented by providers.
-
-Common queries used by RPC and indexing:
-
-- Headers:
-  - `HeaderProvider::header(block_hash)`
-  - `HeaderProvider::header_by_number(number)`
-  - `HeaderProvider::sealed_header(number)`
-- Blocks:
-  - `BlockReader::block(BlockHashOrNumber)`
-  - `BlockReader::find_block_by_hash(hash, BlockSource)`
-  - `BlockReader::block_range(range)`
-- Transactions:
-  - `TransactionsProvider::transaction_by_hash(hash)`
-  - `TransactionsProvider::transactions_by_block(id)`
-  - `TransactionsProvider::transactions_by_tx_range(range)`
-- Receipts:
-  - `ReceiptProvider::receipt(tx_num)` / `receipt_by_hash(tx_hash)`
-  - `ReceiptProvider::receipts_by_block_id(block_id)`
-  - `ReceiptProvider::receipts_by_tx_range(range)`
-
-Under the hood, these queries may be satisfied from MDBX or static files depending on segment availability and storage settings.
-
-## Accessing state (latest vs historical)
-
-Reth models “state at a point” via state provider selection.
+These reads may be served from MDBX, static files, or RocksDB depending on storage settings and data age.
 
 ### Latest state
 
-```rust
-let state: reth_storage_api::StateProviderBox = provider_factory.latest()?;
+Use `ProviderFactory::latest()` when you need current canonical state.
 
-let account = state.basic_account(&address)?;
-let storage_value = state.storage(address, slot.into())?;
-```
+This is the common path for:
 
-Latest state reads from plain state tables and supports proofs/roots by applying overlays.
+- RPC reads at tip
+- transaction validation
+- payload execution inputs based on canonical head
 
 ### Historical state
 
-Historical state is reconstructed from history tables and changesets.
+Use `history_by_block_number()` or `history_by_block_hash()` when you need state at a past canonical boundary.
 
-```rust
-let state = provider_factory.history_by_block_number(block_number)?;
+Important semantics from `crates/storage/storage-api/src/state.rs`:
 
-let account_then = state.basic_account(&address)?;
-```
+- the returned state includes all changes applied in the target block
+- replaying block `n` usually needs the state after block `n - 1`
+- historical reads can fail once account/storage history has been pruned past the requested block
 
-Important:
+## Transaction lifetime rules
 
-- “Historical state at block N” typically means the state at the start of that block boundary (changes applied in block N are not included). Some call sites shift by `+1` internally to reflect “state after block X” semantics.
-- If history has been pruned past the requested block, the provider returns `StateAtBlockPruned`.
+Keep read providers short-lived.
 
-### State for engine/payload work (DB + in-memory overlay)
+- acquire provider
+- perform a batch of reads
+- drop provider
 
-In engine/payload validation paths, you often need a state view that combines:
+Do not keep a read provider across long async gaps. Long-lived read transactions can block MDBX cleanup and interact badly with live writes.
 
-- persisted DB state (at or near tip), and
-- in-memory executed blocks (canonical head / pending).
+## Write path rules
 
-Use `BlockchainProvider` (which snapshots DB + in-memory state consistently) or `OverlayStateProviderFactory` when you need explicit overlay construction.
+Use `provider_rw()` for the full atomic write unit.
 
-## Static file access (when you really need it)
+Guidelines:
 
-Most code should not manipulate static files directly; stages and pipeline utilities handle moving data into static files.
+- stage writes through provider traits
+- call `commit()` once per intended atomic batch
+- rely on provider commit ordering to synchronize MDBX, static files, and pending RocksDB batches
 
-If you are writing tooling/tests and need direct access:
+Use `unwind_provider_rw()` only when implementing unwind/recovery flows that need the alternate commit order.
 
-```rust
-use reth_static_file_types::StaticFileSegment;
+## When to use special helpers
 
-let sf = provider_factory.static_file_provider();
+### `ConsistentDbView`
 
-// Reading:
-let highest_headers = sf.get_highest_static_file_block(StaticFileSegment::Headers);
+`crates/storage/provider/src/providers/consistent_view.rs`
 
-// Writing (requires RW access):
-let mut writer = sf.latest_writer(StaticFileSegment::Headers)?;
-// writer.append_header(...)
-writer.commit()?;
-```
+Use this when you need a stable read snapshot while the node may continue moving forward. It rechecks that the requested tip still exists before handing out a provider.
 
-Notes:
+### Static-file access
 
-- `StaticFileProvider::read_only(path, watch)` is the right choice for external readers.
-- `commit()` updates the static-file index; data should not be assumed visible before commit/finalize.
+Most callers should not open static-file writers directly.
 
-## Transaction lifetime and safety tips
+Direct static-file APIs are appropriate when you are:
 
-- Keep RO transactions short; open provider, query, drop.
-- Avoid holding providers across async awaits.
-- Call `commit()` exactly once per intended atomic unit of work.
-- `DBProvider::disable_long_read_transaction_safety()` is only appropriate when no concurrent write transactions exist (node offline).
-- If you are using `EitherWriter` for RocksDB-backed tables, ensure the raw batch is registered with the provider (pending batch) and rely on `provider.commit()` to make it visible.
+- implementing pipeline/storage internals
+- building tests around static-file behavior
+- operating on segment-specific maintenance code
 
-## “Which provider should I use?” quick mapping
+Relevant paths:
 
-- I need a few point queries from local storage: `provider_factory.provider()?`.
-- I need to write MDBX and/or static files: `provider_factory.provider_rw()?` then `commit()`.
-- I need canonical chain reads that include in-memory head/pending: `BlockchainProvider` and its consistent provider.
-- I need state at tip: `provider_factory.latest()?`.
-- I need state at historical block: `provider_factory.history_by_block_number(...)` (subject to pruning).
-- I need a DB+overlay state view for payload execution/validation: `OverlayStateProviderFactory` or engine-specific helpers that use it.
+- provider-side manager: `crates/storage/provider/src/providers/static_file/manager.rs`
+- segment definitions: `crates/static-file/types/src/segment.rs`
+- producer: `crates/static-file/static-file/src/static_file_producer.rs`
+
+### RPC-backed provider
+
+`crates/storage/rpc-provider/src/lib.rs`
+
+Use `RpcBlockchainProvider` when you need the provider trait surface against a remote node instead of a local datadir.
+
+Good fit:
+
+- ExEx or tool testing without local storage
+- remote chain-data/state access with provider-like APIs
+
+## Quick mapping
+
+- read a local node datadir: `ProviderFactoryBuilder::open_read_only()`
+- make a few local queries inside node code: `ProviderFactory::provider()`
+- write local chain/state data: `ProviderFactory::provider_rw()` then `commit()`
+- read latest canonical state: `ProviderFactory::latest()`
+- read prunable historical state: `ProviderFactory::history_by_block_number/hash()`
+- get a reorg-aware stable view: `ConsistentDbView`
+- use provider traits over RPC: `RpcBlockchainProvider`
+
+## Retrieval map
+
+- builder/opening RO access: `crates/storage/provider/src/providers/database/builder.rs`
+- provider factory: `crates/storage/provider/src/providers/database/mod.rs`
+- transactional provider: `crates/storage/provider/src/providers/database/provider.rs`
+- consistent snapshot helper: `crates/storage/provider/src/providers/consistent_view.rs`
+- provider traits: `crates/storage/storage-api/src/`
+- remote provider: `crates/storage/rpc-provider/src/lib.rs`

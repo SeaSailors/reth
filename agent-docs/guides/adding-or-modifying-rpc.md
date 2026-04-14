@@ -1,180 +1,131 @@
 # Adding or Modifying RPC
 
-This guide shows where to make changes when you want to add or modify JSON-RPC functionality in Reth.
+Use this when changing a built-in RPC method, adding a new namespace, or installing a custom extension.
 
-It covers both:
+## Fast decision tree
 
-- Editing Reth’s built-in namespaces (e.g. `eth_`, `debug_`, `trace_`, `net_`, `admin_`, `reth_`).
-- Plugging in custom namespaces/modules via `NodeBuilder` hooks without forking core wiring.
+### Change behavior of an existing method
 
-## Mental Model
+Follow this path:
 
-Reth’s RPC pipeline is:
+1. find the trait in `crates/rpc/rpc-api/src/`
+2. find the handler in `crates/rpc/rpc/src/` or `crates/rpc/rpc-engine-api/src/`
+3. update the implementation
+4. verify the method is still included by `RpcRegistryInner::reth_methods` in `crates/rpc/rpc-builder/src/lib.rs`
 
-1. Define the RPC surface as a `jsonrpsee` `#[rpc]` trait (namespace + method names).
-2. Implement the generated `*ApiServer` trait for a handler struct.
-3. Ensure the handler is wired into module assembly (`RpcModuleBuilder` / `RpcRegistryInner`) OR merged via `NodeBuilder::extend_rpc_modules`.
-4. Ensure the right transport(s) expose it (HTTP/WS/IPC module selection) and that the server(s) are enabled.
+Use this for changes inside existing namespaces such as `eth`, `debug`, `trace`, `net`, or `web3`.
 
-## A) Modify an Existing Method (Built-in Namespace)
+### Add a method to an existing built-in namespace
 
-Use this path when the method already exists and you are changing behavior, response shape, or validation.
+1. add the method to the namespace trait in `crates/rpc/rpc-api/src/`
+2. implement the generated `*Server` trait on the handler
+3. confirm the namespace is already wired in `reth_methods`
+4. if the method is subscription-based, verify the intended transport exposure
 
-1. Find the trait definition
+### Add a new built-in namespace
 
-- Most traits live under `crates/rpc/rpc-api/src/`.
-- The central re-export list is `crates/rpc/rpc-api/src/lib.rs` (`pub mod servers { ... }`).
+1. create a new `#[rpc]` trait file in `crates/rpc/rpc-api/src/`
+2. re-export it from `crates/rpc/rpc-api/src/lib.rs`
+3. implement the handler in `crates/rpc/rpc/src/` or another RPC crate
+4. add a `RethRpcModule` variant in `crates/rpc/rpc-server-types/src/module.rs` if the namespace should be transport-selectable
+5. wire the namespace into `RpcRegistryInner::reth_methods`
 
-2. Find the handler implementation
+This is a core Reth change, not the recommended path for downstream-only customization.
 
-- Many built-in handlers are implemented in `crates/rpc/rpc/src/`.
-- Some eth-related pieces are split into shared crates like `crates/rpc/rpc-eth-api/`.
+### Add a downstream custom namespace
 
-3. Update the implementation
+Preferred path:
 
-- Keep method names stable (the `#[method(name = "...")]` literal controls the JSON-RPC method suffix).
-- Prefer mapping errors into proper RPC error objects (`jsonrpsee_types::ErrorObject`) rather than panicking.
+- use `NodeBuilder::extend_rpc_modules` in `crates/node/builder/src/builder/mod.rs`
+- see `examples/node-custom-rpc/src/main.rs`
 
-4. Ensure the module is still wired
+Inside the hook:
 
-- Built-in namespaces are wired in `RpcRegistryInner::reth_methods(...)` in `crates/rpc/rpc-builder/src/lib.rs`.
-- If you only changed the handler implementation, you typically don’t need to touch builder wiring.
+- read components from `ctx`
+- build a handler that implements a generated `*Server` trait
+- merge it into transports with `ctx.modules.merge_configured(...)`
 
-## B) Add a New Method to an Existing Namespace
+Use `merge_if_module_configured(...)` if the extension should respect a specific module selection.
 
-Use this path when you want to add `eth_newThing`, `debug_newThing`, etc.
+## Where names come from
 
-1. Add the method to the `#[rpc]` trait
+Method names are set by the `jsonrpsee` trait definitions in `crates/rpc/rpc-api/src/`.
 
-- Edit the appropriate file in `crates/rpc/rpc-api/src/` (e.g. `web3.rs`, `debug.rs`, etc.).
-- Add a new `#[method(name = "...")]` entry (or `#[subscription(...)]` for pubsub).
+Practical rule:
 
-2. Implement the new method
+- namespace string controls the prefix
+- `#[method(name = "...")]` controls the suffix
 
-- Add the method to the handler’s `impl <Trait>Server for <Handler>`.
-- If the handler type is shared across multiple namespaces (common for `eth_` composites), ensure you add it to the correct struct.
+If you want the external JSON-RPC name to stay stable, keep those literals stable.
 
-3. Verify assembly
+## Public RPC vs auth RPC
 
-- If the namespace is already part of `RethRpcModule` and wired in `reth_methods(...)`, it will be included automatically when that module is selected for the transport.
-- If the method is a subscription, ensure the transport supports subscriptions as intended (WS and/or HTTP depending on configuration).
+### Public RPC
 
-## C) Add a New Built-in Namespace (Core Reth Change)
+Public HTTP / WS / IPC modules are built through:
 
-Use this path when you want to introduce a new built-in module like `foo_`.
+- `TransportRpcModuleConfig`
+- `RpcModuleBuilder`
+- `TransportRpcModules`
+- `RpcServerConfig`
 
-1. Create the `jsonrpsee` trait
+### Auth RPC
 
-- Add `crates/rpc/rpc-api/src/foo.rs` defining your `#[rpc(server, namespace = "foo")]` trait.
-- Export it via `crates/rpc/rpc-api/src/lib.rs` (add module + re-export in `servers`).
+Engine API belongs on the auth server, not the public server.
 
-2. Implement the handler
+Use these files:
 
-- Add a handler type in an appropriate crate (often `crates/rpc/rpc/src/foo.rs`).
-- Implement `FooApiServer` for your handler.
+- `crates/rpc/rpc-builder/src/auth.rs`
+- `crates/rpc/rpc-engine-api/src/engine_api.rs`
+- `crates/node/builder/src/rpc.rs`
 
-3. Decide how it should be selectable
+If you need extra authenticated methods, mutate `ctx.auth_module` during `extend_rpc_modules`.
 
-Reth’s transport selection is driven by `RethRpcModule` / `RpcModuleSelection`:
+## Transport selection rules
 
-- `RethRpcModule` variants are defined in `crates/rpc/rpc-server-types/src/module.rs`.
-- If you want `--http.api ...` / `--ws.api ...` style selection support, add a new `RethRpcModule` variant.
+From `crates/rpc/rpc-builder/src/config.rs` and `crates/node/core/src/args/rpc_server.rs`:
 
-4. Wire it into the module registry
+- enabling `--http` without `--http.api` exposes the standard set: `eth`, `net`, `web3`
+- enabling `--ws` without `--ws.api` exposes the same standard set
+- IPC defaults to all modules unless disabled
+- auth server is configured separately with `--authrpc.*`
 
-- Update `RpcRegistryInner::reth_methods(...)` in `crates/rpc/rpc-builder/src/lib.rs` to map your new module variant to your handler’s `into_rpc()`.
-- Ensure you don’t create method name conflicts when merging modules.
+This matters when a method “exists” in code but is not visible on the transport you are testing.
 
-5. Optional: add it to “standard” selection
+## Useful mutation APIs
 
-If appropriate, include it in the project’s “standard” module set (depends on how `RpcModuleSelection::Standard` is defined).
+`TransportRpcModules` in `crates/rpc/rpc-builder/src/lib.rs`:
 
-## D) Add a Custom Namespace Without Changing Core Wiring (Recommended for Integrators)
-
-If you are building a downstream node, adding “one more namespace” is best done via node builder hooks.
-
-The key API is:
-
-- `NodeBuilder::extend_rpc_modules(|ctx| { ... })`
-
-Example pattern (from `examples/node-custom-rpc/src/main.rs`):
-
-```rust
-builder.extend_rpc_modules(move |ctx| {
-    // Access node components (pool/provider/network) from ctx.
-    let pool = ctx.pool().clone();
-
-    // Build your custom handler that implements a jsonrpsee-generated *Server trait.
-    let ext = TxpoolExt { pool };
-
-    // Merge into all configured transports (HTTP/WS/IPC that are enabled).
-    ctx.modules.merge_configured(ext.into_rpc())?;
-
-    Ok(())
-})
-```
-
-Notes:
-
-- `ctx.modules` is a `TransportRpcModules` wrapper.
-- `merge_configured(...)` merges into *all configured transports*.
-- If you want to only expose a custom extension when a specific module is enabled, use:
-  - `ctx.modules.merge_if_module_configured(module, methods)`
-
-## E) Add Custom Methods to the Auth (Engine API) Server
-
-The authenticated server is built from `AuthRpcModule` and started via `AuthServerConfig`.
-
-- Auth server is JWT-protected via `AuthLayer(JwtAuthValidator)`.
-- Default auth module is created by `RpcRegistryInner::create_auth_module(...)` and includes:
-  - `engine_` namespace
-  - a subset of `eth_` handlers via `EngineEthApi`
-
-If you need to add methods to the authenticated module:
-
-- Use the `AuthRpcModule` APIs (merge/remove/replace) at the node wiring layer.
-- The hook surface in `crates/node/builder/src/rpc.rs` provides `ctx.auth_module` (an `AuthRpcModule`).
-
-Practical operations:
-
-- `ctx.auth_module.merge_auth_methods(...)` to add methods.
-- `ctx.auth_module.replace_auth_methods(...)` to override existing methods.
-
-## F) Where Transport and Server Settings Live
-
-There are two distinct configuration axes:
-
-1. What modules are served per transport
-
-- `TransportRpcModuleConfig` selects modules for `http`, `ws`, `ipc`.
-- Under the hood it uses `RpcModuleSelection` and `RethRpcModule`.
-
-2. How servers are started
-
-- `RpcServerConfig` configures HTTP/WS/IPC server settings (addresses, CORS, middleware, IPC endpoint, etc.).
-- `AuthServerConfig` configures the Engine API auth server (address, JWT secret, server config, optional IPC).
-
-If a server isn’t enabled (no HTTP/WS/IPC config set), it won’t start even if modules exist.
-
-## G) Quick Checklist
-
-- Did you add the method to the right `#[rpc]` trait under `crates/rpc/rpc-api/src/`?
-- Did you implement the generated `*ApiServer` trait on your handler?
-- Is the namespace either:
-  - wired into `RpcRegistryInner::reth_methods(...)` (built-in), or
-  - merged through `NodeBuilder::extend_rpc_modules` (custom/integrator) ?
-- Are you merging into the right transports?
-  - `merge_configured` (all enabled)
-  - `merge_http` / `merge_ws` / `merge_ipc` (targeted)
-  - `merge_if_module_configured` (respect module selection)
-- If it’s Engine API / CL-facing, does it belong on the auth server (`AuthRpcModule`) and require JWT?
-
-## Pointers
-
-- RPC traits: `crates/rpc/rpc-api/src/lib.rs`
-- Builder/registry: `crates/rpc/rpc-builder/src/lib.rs`
-- Auth server: `crates/rpc/rpc-builder/src/auth.rs`
-- Auth layer: `crates/rpc/rpc-layer/src/auth_layer.rs`
-- Node hook integration: `crates/node/builder/src/rpc.rs`
-- Example: `examples/node-custom-rpc/src/main.rs`
-- Example: `examples/rpc-db/src/main.rs`
+- `merge_configured`
+- `merge_if_module_configured`
+- `merge_http`, `merge_ws`, `merge_ipc`
+- `remove_method_from_configured`
+- `rename`
+- `methods_by_module`
+
+`AuthRpcModule` in `crates/rpc/rpc-builder/src/auth.rs`:
+
+- `merge_auth_methods`
+- `replace_auth_methods`
+- `remove_auth_method`
+
+## Minimal debug checklist
+
+If an RPC change does not show up:
+
+1. trait updated in `crates/rpc/rpc-api/src/`
+2. handler implements the generated trait method
+3. namespace is wired into `reth_methods` or merged by `extend_rpc_modules`
+4. the target transport is enabled
+5. the target module is included in `--http.api` or `--ws.api`
+6. for Engine API, confirm you are hitting the auth server with the correct JWT
+
+## Best source files to read next
+
+- interfaces: `crates/rpc/rpc-api/src/lib.rs`
+- built-in handlers: `crates/rpc/rpc/src/lib.rs` and namespace files under `crates/rpc/rpc/src/`
+- builder and module registry: `crates/rpc/rpc-builder/src/lib.rs`
+- CLI-to-server config: `crates/rpc/rpc-builder/src/config.rs`
+- auth server: `crates/rpc/rpc-builder/src/auth.rs`
+- node hook integration: `crates/node/builder/src/rpc.rs`
+- custom namespace example: `examples/node-custom-rpc/src/main.rs`

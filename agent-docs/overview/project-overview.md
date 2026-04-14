@@ -1,73 +1,66 @@
 # Project Overview: Reth
 
-Reth (short for “Rust Ethereum”) is a modular, contributor-friendly, high-performance Ethereum Execution Layer (EL) full node written in Rust. It implements the Ethereum protocol end-to-end (sync, execution, storage, P2P, and JSON-RPC) and is designed to be used both as a standalone node (`reth`) and as a set of reusable libraries/crates.
+Reth is a Rust Ethereum Execution Layer client. It runs as the `reth` node binary and as a modular workspace of reusable crates.
 
-## Key Capabilities / Goals
+## Purpose
 
-- Run a production-grade Ethereum EL full node compatible with Consensus Layer (CL) clients via the Engine API.
-- Emphasize modularity: most subsystems are exposed as composable crates intended for reuse and customization.
-- High performance sync and query: staged-sync architecture, optimized storage layout, and efficient execution integration.
-- Provide rich JSON-RPC surface (e.g., `eth_`, `debug_`, `trace_`, `admin_`) for node operator and developer workflows.
-- Support configurability and adaptability (e.g., alternative components, chain specs, and extensibility hooks).
+- Execute Ethereum blocks and transactions.
+- Sync chain data from peers.
+- Store canonical and historical chain state.
+- Serve Engine API to Consensus Layer clients.
+- Serve JSON-RPC to operators, apps, and tooling.
+- Expose extension points for custom nodes, RPC, EVM, payload building, and ExEx.
 
-## High-level Architecture
+## Tech stack
 
-- **CLI / Node orchestration**: `clap`-based CLI wiring into node configuration, bootstrapping, and service startup (`reth-node-core`, `reth-node-builder`).
-- **Engine API (CL <-> EL bridge)**: Implements the Engine API server (`reth-rpc-engine-api`) and manages live forkchoice / payload handling (`reth-engine-tree`, engine service).
-- **Sync pipeline (staged sync)**: Sequential stage framework (`reth-stages`) that downloads, executes, hashes, and builds trie state with unwind/checkpoint support.
-- **Execution (EVM integration)**: Block/transaction execution via REVM integration (`reth-revm` and execution crates), producing canonical state transitions.
-- **Storage**:
-  - **MDBX database** for state, indices, checkpoints (`reth-db-api`, `reth-db`, table schema in `Tables`).
-  - **Static files** for immutable historical data segments (headers/bodies/receipts/etc.) (`reth-static-file`, `NippyJar`).
-  - **Providers** as the main read/write abstraction layer (`ProviderFactory`, `DatabaseProvider*`, `StateProvider`, `BlockchainProvider`).
-- **Networking (P2P)**: Discovery and Ethereum wire protocols (`reth-network`, `reth-eth-wire`, `reth-discv4`, `reth-discv5`).
-- **Transaction pool**: High-performance mempool for validation, ordering, and gossip (`reth-transaction-pool`).
-- **JSON-RPC**: Modular RPC traits, implementations, and server builders (`reth-rpc-api`, `reth-rpc`, `reth-rpc-builder`).
+- Language: Rust (`edition = "2024"`)
+- Workspace: large Cargo workspace rooted at `Cargo.toml`
+- Main binary: `bin/reth/`
+- Core libraries used by the project: Alloy, REVM, MDBX-backed storage, static-file storage
 
-## Repo Layout
+## Architecture map
 
-- `bin/`: Binary entry points (main node, benches).
-- `crates/`: Core implementation, split into many focused crates (node, rpc, network, storage, stages, engine, etc.).
-- `examples/`: Integration examples (custom nodes/components, Engine API, RPC middleware, storage access, etc.).
-- `testing/`: End-to-end and fixture-driven test suites.
-- `docs/`: Developer documentation and design notes.
-- `llmdocs/`: Project-specific LLM documentation (this file lives in `llmdocs/overview/`).
+- Node composition: `crates/node/*`, `crates/ethereum/node`
+- CLI and config: `crates/cli/*`, `crates/config`, `bin/reth/`
+- Engine API and execution tree: `crates/rpc/rpc-engine-api`, `crates/engine/*`
+- Sync pipeline: `crates/stages/{api,stages,types}`
+- Execution and chain rules: `crates/consensus/*`, `crates/evm/*`, `crates/ethereum/*`
+- Storage and providers: `crates/storage/*`, `crates/static-file/*`
+- Networking: `crates/net/*`
+- JSON-RPC: `crates/rpc/*`
+- Transaction pool and payload building: `crates/transaction-pool`, `crates/payload/*`
+- Trie/state hashing: `crates/trie/*`
+- Extensibility/examples: `crates/exex/*`, `examples/*`
 
-## How to Build/Test (at a Glance)
+## Primary runtime flow
 
-```sh
-# Build the default node binary
-cargo build -p reth
+1. `reth` CLI loads config and node settings.
+2. Node builder wires database, providers, networking, pool, engine, and RPC.
+3. P2P networking and staged sync ingest chain data.
+4. Execution updates state and canonical chain data.
+5. Engine API handles CL-driven forkchoice and payload flows.
+6. JSON-RPC reads through provider abstractions and exposes node state.
 
-# Run workspace tests (recommended)
-cargo nextest run --workspace
+## Key entry points
 
-# Run the Ethereum Foundation tests
-make ef-tests
+- `README.md`
+- `Cargo.toml`
+- `docs/repo/layout.md`
+- `bin/reth/`
+- `crates/node/builder/`
+- `crates/engine/tree/`
+- `crates/rpc/rpc-engine-api/`
+- `crates/stages/stages/`
+- `crates/storage/provider/`
+- `crates/net/network/`
+- `crates/transaction-pool/`
 
-# CI-like local gate (format/lint/docs/tests)
-make pr
-```
+## Related docs
 
-Notes:
-- Minimum Supported Rust Version (MSRV) is Rust 1.88.
-
-## Key Entry Points / Where to Start Reading
-
-- `bin/reth/src/main.rs`: Main CLI entry point.
-- `crates/ethereum/cli/src/interface.rs`: CLI interface (`Cli`, `Commands`) and subcommand definitions.
-- `crates/node/core/src/node_config.rs`: `NodeConfig` and configuration aggregation.
-- `crates/node/builder/src/lib.rs`: Node adapter wiring and programmatic node construction entry point.
-- `crates/node/builder/src/launch/engine.rs`: Engine-node bootstrap sequence (context, DB, providers, components, services, RPC).
-- `crates/rpc/rpc-api/src/lib.rs`: RPC trait definitions/registry for namespaces.
-- `crates/rpc/rpc-builder/src/lib.rs`: RPC module/server construction and transport wiring.
-- `crates/rpc/rpc-engine-api/src/engine_api.rs`: Engine API server implementation.
-- `crates/stages/stages/src/lib.rs`: Staged sync framework and stage registry.
-- `crates/storage/db/src/lib.rs`: Database layer entry point.
-
-## Glossary
-
-- **Engine API**: The JSON-RPC interface between Consensus Layer (CL) and Execution Layer (EL) clients (e.g., `engine_newPayload*`, `engine_forkchoiceUpdated*`).
-- **Staged sync**: Sync architecture that progresses the node via discrete sequential stages (download, execute, hash, trie) with checkpoints and unwind support.
-- **Static files**: Immutable, segmented on-disk storage (e.g., headers/transactions/receipts) used to reduce database pressure and optimize sequential reads.
-- **Provider**: Storage abstraction used across the stack for chain/state reads and writes (e.g., `ProviderFactory`, `StateProvider`, `BlockchainProvider`).
+- `agent-docs/architecture/node-builder.md`
+- `agent-docs/architecture/engine-api-and-tree.md`
+- `agent-docs/architecture/staged-sync.md`
+- `agent-docs/architecture/storage-providers.md`
+- `agent-docs/architecture/json-rpc-stack.md`
+- `agent-docs/architecture/p2p-networking.md`
+- `agent-docs/architecture/transaction-pool.md`

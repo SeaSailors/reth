@@ -1,187 +1,116 @@
 # Configuring Reth
 
-This guide is practical/operator-focused: how to run Reth with common flags, how `reth.toml` works, and how config precedence works when you mix defaults, TOML config, and flags.
+Use this when deciding whether a setting belongs in `reth.toml`, on the CLI, or both.
 
-## How Configuration is Layered (Precedence)
+## Fast rule
 
-Reth configuration comes from multiple sources.
+- put stable stage/prune/static-file tuning in `reth.toml`
+- use CLI flags for machine-local startup choices such as RPC exposure, metrics, logging, datadir, database, txpool, builder, and engine tuning
+- expect CLI to win when both surfaces touch the same setting
 
-1. Built-in defaults (Rust defaults / clap defaults)
-2. `reth.toml` loaded into `reth_config::Config`
-3. CLI flags parsed into `NodeConfig` and applied on top of (or merged into) the loaded TOML config
+## Start from a known config
 
-Key implementation points:
+Useful commands:
 
-- `NodeConfig` is the aggregate of CLI arguments (see `crates/node/core/src/node_config.rs`).
-- `reth.toml` is loaded by `LaunchContext::load_toml_config` (see `crates/node/builder/src/launch/common.rs`).
-- Config file path is:
-  - `--config <FILE>` if provided
-  - else `<datadir>/<chain>/reth.toml` (see `crates/node/core/src/dirs.rs` -> `ChainPath::config()`)
+- `reth config --default` prints the default TOML model
+- `reth config --config <FILE>` prints an existing config file
+- `reth node --help` shows the full runtime surface
 
-In practice:
+If you do not pass `--config`, Reth uses `<datadir>/<chain>/reth.toml` and creates it on first load.
 
-- Use `reth.toml` for stable, long-lived settings you want to keep across restarts.
-- Use CLI flags for one-off overrides or environment-specific changes (ports, enabling/disabling servers, etc.).
+## Pick the base location first
 
-## Where Settings Live
+The most important early choices are:
 
-### Datadir and storage locations
+- `--chain <CHAIN_OR_PATH>`
+- `--datadir <DATA_DIR>`
+- optional path overrides:
+  - `--datadir.static-files`
+  - `--datadir.rocksdb`
+  - `--datadir.pprof-dumps`
 
-Datadir flags (see `crates/node/core/src/args/datadir_args.rs`):
+These determine where Reth keeps the database, static files, RocksDB data, JWT secret, and default TOML config.
 
-- `--datadir <DATA_DIR>`: base directory for node data
-- `--datadir.static-files <PATH>`: static files location override
-- `--datadir.rocksdb <PATH>`: RocksDB location override
-- `--datadir.pprof-dumps <PATH>`: pprof dumps location override
+## Common operator workflows
 
-The datadir is chain-scoped (roughly "base dir" + "chain name"):
+### 1. Enable public RPC
 
-- DB: `<datadir>/<chain>/db`
-- Config: `<datadir>/<chain>/reth.toml`
-- Engine API JWT: `<datadir>/<chain>/jwt.hex`
+Use:
 
-(See `crates/node/core/src/dirs.rs`.)
+- `--http`, `--http.addr`, `--http.port`, `--http.api`
+- `--ws`, `--ws.addr`, `--ws.port`, `--ws.api`
+- `--ipcdisable` / `--ipcpath`
 
-### Network / P2P settings
+Practical rule:
 
-Network flags (see `crates/node/core/src/args/network.rs`):
+- enable only the namespaces you need
+- keep `debug` and `trace` off public endpoints unless you control the network boundary
 
-- `--addr` / `--port`: P2P listening interface
-- `--bootnodes <enode,...>`: discovery bootstrap
-- `--trusted-peers <enode,...>` and `--trusted-only`: restrict peering
-- `--no-persist-peers` / `--peers-file <FILE>`: peer persistence
-- `--nat <mode>`: NAT resolution method
-- `--network-id <id>`: override network ID
+### 2. Pair with a consensus client
 
-### RPC settings
+Use the authenticated Engine API settings, not the public RPC settings:
 
-RPC flags (see `crates/node/core/src/args/rpc_server.rs`):
+- `--authrpc.addr`
+- `--authrpc.port`
+- `--authrpc.jwtsecret`
 
-- Enable servers:
-  - `--http`, `--ws` (IPC is enabled unless `--ipcdisable`)
-- Bind / ports:
-  - `--http.addr`, `--http.port`
-  - `--ws.addr`, `--ws.port`
-- API exposure:
-  - `--http.api <modules>`
-  - `--ws.api <modules>`
-- CORS / origins:
-  - `--http.corsdomain <domain>`
-  - `--ws.origins <origins>`
+`--rpc.jwtsecret` is separate; it protects regular HTTP/WS RPC, not the engine auth server.
 
-Engine API (authenticated, for CL <-> EL):
+### 3. Choose a pruning/storage profile
 
-- `--authrpc.addr`, `--authrpc.port`
-- `--authrpc.jwtsecret <PATH>`
-  - If unset, Reth may generate a secret and store it in `<datadir>/<chain>/jwt.hex`.
-- `--disable-auth-server` / `--disable-engine-api`
+High-signal switches:
 
-Safety and performance knobs:
+- `--full`
+- `--minimal`
+- granular `--prune.*` flags
+- `--storage.v2`
+- `--static-files.blocks-per-file.*`
 
-- `--rpc.max-request-size`, `--rpc.max-response-size`
-- `--rpc.max-connections`
-- `--rpc.max-tracing-requests`
-- `--rpc.gascap`, `--rpc.txfeecap`, `--rpc.evm-memory-limit`
+Behavior to remember:
 
-## Practical Commands
+- prune settings may be written back into `reth.toml`
+- `--storage.v2` affects only new databases
+- static-file sizing can come from TOML and be overridden by CLI
 
-### 1) Start a mainnet node with HTTP RPC enabled
+### 4. Tune networking
 
-```sh
-reth node --chain mainnet --http --http.api eth,net,web3
-```
+Most-used knobs:
 
-Notes:
+- discovery toggles: `--disable-discovery`, `--disable-discv4-discovery`, `--enable-discv5-discovery`
+- listener/NAT: `--addr`, `--port`, `--nat`
+- peer source policy: `--bootnodes`, `--trusted-peers`, `--trusted-only`, `--peers-file`
 
-- RPC API modules are explicit. Add `trace`/`debug` only when you need them.
-- If you want the node to be reachable from other hosts, bind to `0.0.0.0` and set CORS appropriately.
+Use TOML for persisted peer/session defaults; use CLI for deployment-specific binds and peer policy overrides.
 
-### 2) Start with both HTTP and WebSocket RPC
+### 5. Run multiple nodes on one machine
 
-```sh
-reth node --http --http.api eth,net,web3 --ws --ws.api eth,net,web3
-```
+Use either:
 
-### 3) Custom datadir
+- `--instance <N>` to apply deterministic port offsets
+- `--with-unused-ports` to let the OS assign random ports
 
-```sh
-reth node --datadir ./data --chain mainnet
-```
+Do not treat them as the same tool:
 
-This changes where Reth stores:
+- `--instance` is for repeatable multi-node layouts
+- `--with-unused-ports` is for tests and ephemeral runs
 
-- `./data/mainnet/db`
-- `./data/mainnet/reth.toml`
-- `./data/mainnet/jwt.hex`
+## Precedence gotchas
 
-### 4) Use a specific config file
+Grounded in `crates/node/builder/src/launch/common.rs` and `crates/cli/commands/src/common.rs`:
 
-```sh
-reth node --config /path/to/reth.toml
-```
+- defaults load first
+- `reth.toml` loads next
+- CLI overrides merge last
+- `trusted_only` is pushed from CLI into TOML-derived peer config
+- prune config may be migrated and saved back to disk
 
-This overrides the default config path that would normally be under the datadir.
+So if a setting “does not stick,” check whether you are editing the wrong surface.
 
-### 5) Run multiple nodes on one machine (`--instance`)
+## Best files for deeper answers
 
-```sh
-reth node --instance 2 --datadir ./data
-```
-
-`--instance` adjusts multiple ports (P2P discovery and RPC ports) to avoid collisions.
-
-### 6) Configure Engine API JWT secret for a consensus client
-
-If your consensus client expects a specific JWT secret file:
-
-```sh
-reth node \
-  --authrpc.jwtsecret /path/to/jwt.hex \
-  --authrpc.addr 127.0.0.1 \
-  --authrpc.port 8551
-```
-
-If you do not pass `--authrpc.jwtsecret`, Reth may generate/store the secret under `<datadir>/<chain>/jwt.hex`.
-
-## Working with `reth.toml`
-
-### Getting a config to start from
-
-Reth provides a way to print default configuration:
-
-```sh
-reth config --default
-```
-
-To inspect an existing config file:
-
-```sh
-reth config --config /path/to/reth.toml
-```
-
-From there, you can write the output into your own `reth.toml` and then point the node at it with `--config`.
-
-### What Reth writes/updates automatically
-
-On startup, Reth may migrate pruning configuration and write updated pruning settings back into the TOML file.
-
-- See `LaunchContext::save_pruning_config` in `crates/node/builder/src/launch/common.rs`.
-
-If you want to keep your config immutable, consider running with a config path that is writable only when you intend to change it (or version it in a separate directory).
-
-## Tips
-
-- Prefer `reth.toml` for stable settings, CLI flags for overrides.
-- Keep Engine API bound to localhost unless you have a secure network boundary.
-- Be cautious enabling `debug`/`trace` modules publicly: they can be expensive and are often sensitive.
-
-## Useful Reference Files
-
-- CLI types: `crates/ethereum/cli/src/interface.rs`
-- NodeConfig: `crates/node/core/src/node_config.rs`
-- Datadir args: `crates/node/core/src/args/datadir_args.rs`
-- Network args: `crates/node/core/src/args/network.rs`
-- RPC args: `crates/node/core/src/args/rpc_server.rs`
-- Config loading/merging: `crates/node/builder/src/launch/common.rs`
-- Datadir derived paths: `crates/node/core/src/dirs.rs`
-- `reth config` command: `crates/cli/commands/src/config_cmd.rs`
+- CLI aggregate type: `crates/node/core/src/node_config.rs`
+- CLI arg groups: `crates/node/core/src/args/`
+- config loading/merge logic: `crates/node/builder/src/launch/common.rs`
+- TOML schema: `crates/config/src/config.rs`
+- CLI help snapshot: `docs/vocs/docs/pages/cli/reth/node.mdx`
+- operator config reference: `docs/vocs/docs/pages/run/configuration.mdx`

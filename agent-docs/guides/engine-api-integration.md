@@ -1,182 +1,138 @@
 # Engine API Integration Guide
 
-This guide is for operators and integrators connecting a Consensus Layer (CL) client (beacon node) to Reth's authenticated Engine API endpoint ("authrpc").
+## Goal
 
-It focuses on practical setup (JWT, HTTP), and how to debug common integration issues using logs and metrics.
+Use this guide when tracing how a consensus client request turns into execution-tree state changes, or when debugging `newPayload` / `forkchoiceUpdated` behavior.
 
-## What The CL Connects To
+Primary source files:
 
-Reth serves the Engine API over the **authenticated RPC server** (commonly referred to as `authrpc`).
+- `crates/rpc/rpc-engine-api/src/engine_api.rs`
+- `crates/rpc/rpc-engine-api/src/capabilities.rs`
+- `crates/engine/primitives/src/message.rs`
+- `crates/engine/tree/src/tree/mod.rs`
+- `crates/engine/tree/src/tree/metrics.rs`
 
-- It exposes the `engine_` namespace (`engine_newPayload*`, `engine_forkchoiceUpdated*`, `engine_getPayload*`, etc).
-- It also exposes a restricted subset of `eth_` methods required by the CL.
+## Practical request path
 
-The Engine API surface is defined in `crates/rpc/rpc-api/src/engine.rs`.
+### New payload
 
-## Authentication: JWT
+Follow this path:
 
-The Engine API server requires JWT authentication.
+1. `EngineApi::new_payload_v1..v4` in `crates/rpc/rpc-engine-api/src/engine_api.rs`
+2. `ConsensusEngineHandle::new_payload` in `crates/engine/primitives/src/message.rs`
+3. `EngineApiTreeHandler::on_new_payload` in `crates/engine/tree/src/tree/mod.rs`
 
-### CLI Flags
+What to check:
 
-Relevant CLI configuration (see `crates/node/core/src/args/rpc_server.rs`):
+- version-specific field validation failed at the RPC layer
+- payload was rejected for invalid ancestry
+- payload was buffered because backfill is active
+- payload returned `SYNCING` because the parent is unknown
+- payload matched the sync target and triggered canonicalization
 
-- `--authrpc.addr <ip>` / `--authrpc.port <port>`
-  - Bind address and port for the authenticated server.
-- `--authrpc.jwtsecret <PATH>`
-  - Path to the JWT secret file (32 bytes hex, usually `jwt.hex`).
-  - If not provided, Reth generates one in the datadir under `<DIR>/<CHAIN_ID>/jwt.hex`.
-- `--disable-auth-server` (alias `--disable-engine-api`)
-  - Disables the auth server entirely.
+### Forkchoice update
 
-### How JWT Is Applied
+Follow this path:
 
-Client requests must include an Authorization header:
+1. `EngineApi::fork_choice_updated_v1..v3`
+2. `validate_and_execute_forkchoice`
+3. `ConsensusEngineHandle::fork_choice_updated`
+4. `EngineApiTreeHandler::on_forkchoice_updated`
 
-- `Authorization: Bearer <jwt>`
+What to check:
 
-Reth's JWT claims follow the execution-apis spec:
+- zero `head_block_hash` returns invalid state early
+- invalid payload attributes do not roll back the forkchoice update
+- active backfill returns `SYNCING`
+- canonical-head fast path handles safe/finalized updates
+- missing heads trigger download/backfill instead of immediate validity
 
-- <https://github.com/ethereum/execution-apis/blob/main/src/engine/authentication.md#jwt-claims>
+## Capability negotiation
 
-(Internally, Reth has a client-side middleware layer that injects this header; see `crates/rpc/rpc-layer/src/auth_client_layer.rs`.)
+`engine_exchangeCapabilities` is implemented in `crates/rpc/rpc-engine-api/src/engine_api.rs` using `crates/rpc/rpc-engine-api/src/capabilities.rs`.
 
-### Common JWT Failure Modes
+Use it to detect EL/CL version skew. Warnings focus on critical families:
 
-- Wrong secret file (EL and CL do not share the same `jwt.hex`).
-- Secret file unreadable (permissions, wrong path).
-- Auth server disabled (`--disable-auth-server`).
-- CL pointing at the non-auth RPC port (8545) instead of authrpc (8551 by default in many setups).
+- `engine_newPayload*`
+- `engine_forkchoiceUpdated*`
+- `engine_getPayload*`
 
-## Transport: HTTP (And Optional IPC)
+If mismatches appear there, treat it as an upgrade / compatibility problem first.
 
-Most CL clients connect via HTTP to `http://<authrpc.addr>:<authrpc.port>`.
+## Status interpretation
 
-Reth also supports authrpc over IPC if enabled:
+### `VALID`
 
-- `--auth-ipc` and `--auth-ipc.path` (see `crates/node/core/src/args/rpc_server.rs`).
+Usually means the tree could connect the request to known state and either:
 
-## Handshake And Capabilities
+- accept the payload, or
+- accept the forkchoice update and possibly start payload building
 
-A typical CL will call:
+### `SYNCING`
 
-- `engine_exchangeCapabilitiesV1`
+Usually means one of:
 
-Reth responds with the capabilities it supports (see `crates/rpc/rpc-engine-api/src/capabilities.rs`).
+- requested head or parent is missing
+- backfill is active
+- the node needs download/pipeline work before it can fully evaluate the request
 
-If the CL is too new/old relative to the EL (mismatched fork support), capability mismatches often show up early.
+### `INVALID`
 
-## Debugging Call Failures
+Usually means one of:
 
-### 1) Enable Relevant Log Targets
+- malformed payload / payload attributes
+- known invalid ancestor
+- inconsistent forkchoice state
 
-Two targets are especially useful:
+## Debug workflow
 
-- `rpc::engine` (RPC method handling)
-  - Example logs: "Serving engine_newPayloadV3", "Serving engine_forkchoiceUpdatedV2".
-  - Source: `crates/rpc/rpc-engine-api/src/engine_api.rs`.
+### Logs
 
-- `engine::tree` (Engine Tree processing)
-  - Receives and processes the actual newPayload/FCU messages.
-  - Source: `crates/engine/tree/src/tree/mod.rs`.
+Start with these targets:
 
-If you see `rpc::engine` logs but nothing from `engine::tree`, the RPC layer is receiving requests but the engine handler is stalled or not wired.
+- `rpc::engine` for RPC method entry and capability negotiation
+- `engine::tree` for tree decisions, buffering, canonicalization, and sync-mode behavior
 
-### 2) Watch For Timeouts / Dropped Responses
+### Metrics
 
-The Engine Tree tracks how often it fails to deliver responses back to the RPC server (usually because the CL timed out and dropped the request):
+Check RPC-layer latency in `engine.rpc.*` from `crates/rpc/rpc-engine-api/src/metrics.rs`.
 
-- `consensus.engine.beacon.failed_new_payload_response_deliveries`
-- `consensus.engine.beacon.failed_forkchoice_updated_response_deliveries`
+Check tree-side counters / latency in `crates/engine/tree/src/tree/metrics.rs`, especially:
 
-These metrics are defined in `crates/engine/tree/src/tree/metrics.rs`.
-
-If these counters climb, focus on:
-
-- `sync.block_validation.total_duration` (slow `newPayload` processing)
-- persistence duration and pipeline/backfill state
-- host CPU saturation / DB IO saturation
-
-### 3) Distinguish RPC Latency vs Engine Processing
-
-Reth also records **RPC handler latency** per method:
-
-- `engine.rpc.*`
-  - `engine.rpc.new_payload_v1..v4`
-  - `engine.rpc.fork_choice_updated_v1..v3`
-  - `engine.rpc.get_payload_v1..v5`
-
-These are defined in `crates/rpc/rpc-engine-api/src/metrics.rs`.
+- forkchoice result counters
+- block-validation timing
+- failed response delivery counters for `newPayload` and `forkchoiceUpdated`
 
 Interpretation:
 
-- High `engine.rpc.new_payload_v*` latency usually means the call is waiting on the engine handler / execution.
-- High tree metrics (block validation, state root) point to execution cost.
+- high RPC latency with normal tree metrics usually means the request waited on engine work
+- high tree validation latency points to execution / state-root / sync pressure
+- failed response delivery counters mean the caller gave up before the engine replied
 
-### 4) Common Symptoms And Likely Causes
+## Where to instrument
 
-- `engine_forkchoiceUpdated*` returns `SYNCING`
-  - Engine Tree is in backfill sync (pipeline needs exclusive DB access) or head is missing.
-  - See `EngineApiTreeHandler::validate_forkchoice_state` behavior in `crates/engine/tree/src/tree/mod.rs`.
+For transport and validation issues:
 
-- `engine_newPayload*` returns `SYNCING`
-  - Parent block missing / block disconnected. The payload may be buffered.
+- `crates/rpc/rpc-engine-api/src/engine_api.rs`
 
-- `engine_forkchoiceUpdated*` returns `INVALID` immediately
-  - Invalid forkchoice state (e.g., `headBlockHash == 0`) or references invalid ancestry.
+For message-handoff issues:
 
-- Payload attributes rejected but forkchoice still applied
-  - By spec, forkchoice updates must not be rolled back if payload attribute validation fails.
-  - Reth will forward the forkchoice update with `payload_attrs = None` to the Engine Tree.
-  - See `EngineApi::validate_and_execute_forkchoice` in `crates/rpc/rpc-engine-api/src/engine_api.rs`.
+- `crates/engine/primitives/src/message.rs`
 
-- `engine_getPayloadV*` returns unknown payload
-  - Payload ID not found in `PayloadStore` (payload build job expired/terminated or never started).
-  - Look at payload builder logs (`target: "payload_builder"`) and confirm FCU contained attributes.
+For state-machine and canonicalization issues:
 
-### 5) Where To Set Breakpoints / Add Tracing
+- `crates/engine/tree/src/tree/mod.rs`
 
-If you need to debug the code path:
+For backfill / live-sync coordination:
 
-- RPC method entry:
-  - `crates/rpc/rpc-engine-api/src/engine_api.rs` (`impl EngineApiServer for EngineApi`)
+- `crates/engine/tree/src/lib.rs`
+- `crates/engine/tree/src/backfill.rs`
+- `crates/engine/tree/src/chain.rs`
 
-- The engine handoff boundary:
-  - `crates/engine/primitives/src/message.rs` (`ConsensusEngineHandle::{new_payload,fork_choice_updated}`)
+## Minimal mental model
 
-- Engine tree core logic:
-  - `crates/engine/tree/src/tree/mod.rs`
-    - `on_new_payload`
-    - `try_insert_payload` / `try_buffer_payload`
-    - `on_forkchoice_updated`
-
-- Payload building:
-  - `crates/payload/builder/src/service.rs` (`PayloadBuilderService`, `PayloadStore`)
-
-## Minimal "Checklist" For A Healthy CL<->EL Connection
-
-- Auth server is enabled (do not pass `--disable-auth-server`).
-- CL points to the correct authrpc address/port.
-- EL and CL share the exact same JWT secret.
-- `engine_exchangeCapabilitiesV1` succeeds.
-- You see `rpc::engine` logs for incoming requests.
-- You see `engine::tree` logs for processing and metrics moving.
-
-## Execution APIs Spec References
-
-Reth's Engine API trait and implementation include direct references to the spec:
-
-- Underlying protocol: <https://github.com/ethereum/execution-apis/blob/main/src/engine/common.md#underlying-protocol>
-- JWT authentication: <https://github.com/ethereum/execution-apis/blob/main/src/engine/authentication.md>
-- Engine methods:
-  - Paris: <https://github.com/ethereum/execution-apis/blob/main/src/engine/paris.md>
-  - Shanghai: <https://github.com/ethereum/execution-apis/blob/main/src/engine/shanghai.md>
-  - Cancun: <https://github.com/ethereum/execution-apis/blob/main/src/engine/cancun.md>
-  - Prague: <https://github.com/ethereum/execution-apis/blob/main/src/engine/prague.md>
-  - Osaka: <https://github.com/ethereum/execution-apis/blob/main/src/engine/osaka.md>
-
-In-repo pointers:
-
-- RPC trait docs: `crates/rpc/rpc-api/src/engine.rs`
-- RPC implementation docs: `crates/rpc/rpc-engine-api/src/engine_api.rs`
-- Engine tree docs: `crates/engine/tree/src/tree/mod.rs`
+- RPC validates and forwards.
+- `ConsensusEngineHandle` bridges async RPC to the engine thread.
+- The execution tree decides validity, buffering, download, backfill, and canonicalization.
+- Payload building hangs off valid forkchoice updates with attributes.
+- Persistence is background work, not the main decision point for Engine API acceptance.

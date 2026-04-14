@@ -1,244 +1,141 @@
 # ChainSpec and Hardforks
 
-This document explains how Reth models chain configuration (genesis + parameters + hardfork schedule), how fork activation is represented, and how fork identifiers are computed and used for peer-to-peer compatibility filtering.
+## Purpose
 
-## What "ChainSpec" means in Reth
+`crates/chainspec` is the execution-layer source of truth for:
 
-At a high level, a chain specification answers:
+- chain identity
+- genesis header and alloc
+- fork activation schedule
+- base-fee and blob-parameter schedule
+- bootnodes, deposit-contract metadata, and prune defaults
+- network fork-id / fork-filter compatibility
 
-- What chain are we on? (chain id / network identity)
-- What is the genesis block? (genesis header + genesis state / config)
-- When do protocol upgrades (hardforks) activate? (block-based, timestamp-based, or merge/TTD-based)
-- What auxiliary parameters depend on forks? (base fee params, blob params schedule, pruning limits, etc.)
+`ChainSpec` is the default Ethereum implementation. `EthChainSpec` is the trait boundary used by the rest of the node.
 
-Reth’s central type for this is `reth_chainspec::ChainSpec`.
-
-Code: `crates/chainspec/src/spec.rs`
-
-## Core types
+## Main types
 
 ### `ChainSpec`
 
-`ChainSpec` is the concrete Ethereum EL chainspec used by the default `reth` node.
+Defined in `crates/chainspec/src/spec.rs`.
 
-Key fields (non-exhaustive):
+Key fields:
 
-- `chain: Chain`: chain identity / chain id.
-- `genesis: Genesis`: the full genesis configuration (alloc + config fields like fork blocks/timestamps).
-- `genesis_header: SealedHeader`: the genesis block header (hashed + sealed).
-- `paris_block_and_final_difficulty: Option<(u64, U256)>`: merge (Paris) activation metadata used by EL.
-- `hardforks: ChainHardforks`: ordered set of hardfork activation rules.
-- `deposit_contract: Option<DepositContract>`: PoS deposit contract metadata (if applicable).
-- `base_fee_params: BaseFeeParamsKind`: base fee computation parameters (constant or fork-dependent).
-- `blob_params: BlobScheduleBlobParams`: per-fork blob parameter schedule.
+- `chain`: chain id / named chain
+- `genesis`: parsed `alloy_genesis::Genesis`
+- `genesis_header`: sealed genesis header derived from `genesis` + active forks
+- `hardforks`: ordered `ChainHardforks`
+- `paris_block_and_final_difficulty`: Paris / merge metadata when known
+- `base_fee_params` and `blob_params`: fork-sensitive fee/blob schedule
+- `deposit_contract`: optional PoS deposit contract metadata
 
-Code: `crates/chainspec/src/spec.rs`
+Built-in specs are exposed as lazy `Arc<ChainSpec>` values such as `MAINNET`, `SEPOLIA`, `HOLESKY`, `HOODI`, and `DEV`. `ChainSpec::from_chain_id` maps known ids to those built-ins.
 
-### `Hardforks`, `ChainHardforks`, and `Hardfork`
+### `EthChainSpec`
 
-Fork scheduling is modeled by the `reth_ethereum_forks::Hardforks` trait and the `ChainHardforks`
-container.
+Defined in `crates/chainspec/src/api.rs`.
 
-- `Hardfork` is a trait implemented by fork enums (e.g. `EthereumHardfork`).
-- `ChainHardforks` stores `(fork, condition)` pairs and keeps them in activation order.
-- `Hardforks` is the abstraction used by networking and other subsystems to ask:
-  - what is the activation condition for fork X?
-  - what are all forks + conditions in order?
+This is the read-only trait consumed across the node. It exposes:
 
-Code:
+- chain / chain id
+- genesis hash and header
+- base-fee params and blob params at a timestamp
+- bootnodes
+- deposit contract
+- final Paris TTD
 
-- Trait/container: `crates/ethereum/hardforks/src/hardforks/mod.rs`
-- Ethereum fork enum/types are re-exported from Alloy via `reth_ethereum_forks`.
+Use this trait when a subsystem should depend on chain behavior without requiring the concrete `ChainSpec` type.
 
-### `ForkCondition`
+### Hardfork containers and traits
 
-`ForkCondition` is the activation rule for a given hardfork.
+Re-exported through `crates/chainspec/src/lib.rs` from `crates/ethereum/hardforks/src/lib.rs`.
 
-It supports:
+Important pieces:
 
-- `Block(n)`: activates at block number `n`.
-- `Timestamp(t)`: activates at timestamp `t`.
-- `TTD { total_difficulty, activation_block_number, fork_block }`: merge/Paris style activation.
-  - `fork_block` can optionally encode a known merge netsplit block (needed for some networks).
-- `Never`: fork is disabled / absent.
+- `Hardfork`: trait for a single fork marker
+- `ChainHardforks`: ordered map of fork -> `ForkCondition`
+- `Hardforks`: query trait for activation checks, iteration, fork ids, and fork filters
+- `EthereumHardforks`: typed access to standard Ethereum forks
+- `ForkCondition`: activation rule (`Block`, `Timestamp`, `TTD`, or `Never`)
 
-Important behavior:
+`ChainSpec` implements both `Hardforks` and `EthereumHardforks`.
 
-- `ChainHardforks::insert` reorders forks based on `ForkCondition`'s ordering so that iteration is
-  activation-ordered.
-- For "equivalent" forks (e.g. Optimism forks plus their corresponding Ethereum forks), duplicates
-  can exist; some downstream logic intentionally de-duplicates when computing fork hashes.
+## How specs are built
 
-Code: `crates/ethereum/hardforks/src/hardforks/mod.rs` (ordering semantics)
+### From built-ins
 
-## Built-in chain specs
+Built-in specs in `crates/chainspec/src/spec.rs` start from static genesis/config data and predefined Ethereum fork schedules such as `EthereumHardfork::mainnet()`.
 
-Reth provides built-in chainspecs as lazily-initialized `Arc<ChainSpec>` values.
+### From genesis JSON
 
-Code: `crates/chainspec/src/spec.rs`
+`impl From<Genesis> for ChainSpec` in `crates/chainspec/src/spec.rs` converts `alloy_genesis::Genesis` into a concrete spec by:
 
-- `MAINNET`: Mainnet genesis + hardfork schedule (`EthereumHardfork::mainnet()`), includes
-  deposit contract metadata and a blob params schedule.
-- `SEPOLIA`: Sepolia genesis + hardfork schedule (`EthereumHardfork::sepolia()`), includes deposit
-  contract metadata.
-- `HOLESKY`: Holesky genesis + hardfork schedule (`EthereumHardfork::holesky()`), includes deposit
-  contract metadata.
-- `DEV`: Dev testnet spec.
+- extracting block-based forks from genesis config
+- extracting timestamp-based forks from genesis config
+- deriving Paris TTD data when present
+- constructing the genesis header through `make_genesis_header`
+- carrying through blob schedule and deposit-contract metadata
 
-Notes:
+Important limitation: external genesis parsing cannot always infer merge activation precisely when only TTD is known. The conversion logic special-cases known networks where possible.
 
-- Built-in chainspecs are used by default in both the CLI and `NodeConfig`.
-- `ChainSpec::from_chain_id(chain_id)` maps known chain ids to a built-in spec (`mainnet`,
-  `sepolia`, `holesky`, `hoodi`, `dev`).
+### From `ChainSpecBuilder`
 
-## From genesis JSON to a `ChainSpec`
+`ChainSpecBuilder` in `crates/chainspec/src/spec.rs` is the shortest path for programmatic customization.
 
-The default CLI accepts either a built-in chain name or a path/raw JSON for a genesis file.
+High-signal methods:
 
-Genesis parsing happens via `reth_cli::chainspec::parse_genesis`, which:
+- `mainnet()` to clone the default mainnet base
+- `chain(...)`
+- `genesis(...)`
+- `reset()`
+- `with_fork(...)` / `with_forks(...)`
+- `without_fork(...)`
+- `paris_at_ttd(...)`
+- convenience activation helpers such as `london_activated()`, `prague_activated()`, `with_prague_at(...)`, `with_osaka_at(...)`
+- `build()`
 
-- first tries to read the argument as a file path;
-- if that fails and the string contains `{`, treats it as inline JSON;
-- deserializes into `alloy_genesis::Genesis`.
+Use the builder when you are still operating on Ethereum-style forks and only need to adjust activation points or genesis.
 
-Then, the `Genesis` is converted into a `ChainSpec` via `impl From<Genesis> for ChainSpec`.
+## Fork ids and networking
 
-Important nuance:
+`ChainSpec` also owns peer-compatibility state.
 
-- For merge (`Paris`) activation, external genesis files may not include enough information to
-  infer merge activation precisely. Reth includes special-casing for mainnet/sepolia based on chain
-  id + TTD if the merge block is not discoverable.
+### `fork_id`
 
-Code: `crates/chainspec/src/spec.rs` (conversion logic)
+`ChainSpec::fork_id` computes the EIP-6122 fork id for a given `Head` in `crates/chainspec/src/spec.rs`.
 
-## Building chain specs programmatically: `ChainSpecBuilder`
+Behavior:
 
-`ChainSpecBuilder` is a small convenience builder for composing a `ChainSpec` in code.
+- start from genesis hash
+- apply active block-based forks first
+- then apply active timestamp-based forks
+- return the next activation point as `next`
+- skip duplicate activation points
 
-It supports:
+### `fork_filter`
 
-- selecting a base (e.g. `ChainSpecBuilder::mainnet()`),
-- setting `chain(...)` and `genesis(...)`,
-- adding/removing forks:
-  - `with_fork(fork, condition)`
-  - `with_forks(ChainHardforks)`
-  - `without_fork(fork)`
-- helper methods for common activation patterns (activate everything at genesis, `paris_at_ttd`,
-  `with_prague_at`, etc.).
+`ChainSpec::fork_filter` builds a `ForkFilter` for peer validation.
 
-`build()` constructs the final `ChainSpec`, including deriving `paris_block_and_final_difficulty`
-from the Paris/TTD entry if present.
+Important nuance: TTD forks without a known `fork_block` are omitted from the filter because they cannot be validated by deterministic block or timestamp activation.
 
-Code: `crates/chainspec/src/spec.rs`
+This feeds P2P compatibility checks in the networking stack.
 
-## Fork identifiers and fork filtering
+## Custom hardfork path
 
-Ethereum clients use fork identifiers to avoid connecting to peers on incompatible forks.
+The full custom-fork example lives in `examples/custom-hardforks/src/chainspec.rs`.
 
-Reth uses two related concepts:
+It shows how to:
 
-- `ForkId` (EIP-2124 / EIP-6122 style identifier): included in the ETH status handshake.
-- `ForkFilter`: a structure that validates peer `ForkId` values against the local chain’s schedule.
+- define new forks with the `hardfork!` macro
+- deserialize custom fork settings from `genesis.config.extra_fields`
+- wrap an inner `ChainSpec`
+- implement `Hardforks`, `EthChainSpec`, and `EthereumHardforks` for the wrapper
 
-Types are provided by `reth_ethereum_forks` (re-exporting Alloy’s EIP-2124 types).
+Use this path only when Ethereum's built-in fork enum is not enough.
 
-### Computing a `ForkId` from a `ChainSpec`
+## Read next
 
-`ChainSpec::fork_id(&self, head: &Head) -> ForkId` computes the fork id "as of" a given head.
-
-Algorithm (as implemented in Reth, following EIP-6122):
-
-- Initialize the fork hash with the genesis hash.
-- Process block-based forks first:
-  - for each block-based fork condition that is active at `head.number`, add the fork block number
-    into the rolling hash.
-  - if a fork is not active yet, return `(hash, next = fork_block)`.
-  - special case: `ForkCondition::TTD { fork_block: Some(block), .. }` is treated as a block fork
-    for fork-id purposes.
-- Then process timestamp-based forks (only those after genesis timestamp):
-  - for each timestamp-based fork condition that is active at `head.timestamp`, add the timestamp
-    into the rolling hash.
-  - if a timestamp fork is not active yet, return `(hash, next = timestamp)`.
-- If all known forks are active, return `(hash, next = 0)`.
-
-Deduplication behavior:
-
-- If multiple forks share the same activation block/timestamp, only the first contributes.
-  This is tracked via a `current_applied` marker.
-
-Code: `crates/chainspec/src/spec.rs`
-
-### `hardfork_fork_id` and `latest_fork_id`
-
-Convenience helpers:
-
-- `ChainSpec::hardfork_fork_id(fork) -> Option<ForkId>`: compute the fork id at the activation
-  point of a particular fork (using an internal "satisfy" helper).
-- `ChainSpec::latest_fork_id() -> ForkId`: the fork id for the last configured fork.
-
-Code: `crates/chainspec/src/spec.rs`
-
-### Fork filters (`ForkFilter`)
-
-`ChainSpec::fork_filter(head: Head) -> ForkFilter` creates a filter for validating a peer’s
-reported fork id, seeded from:
-
-- `head` (the local head at time of construction),
-- `genesis_hash` and `genesis_timestamp`,
-- the list of fork activation points (block numbers and timestamps).
-
-TTD forks without a known `fork_block` are intentionally omitted from the filter (because peers
-cannot validate them by a deterministic block/timestamp activation point).
-
-Code: `crates/chainspec/src/spec.rs`
-
-## Where `ForkId` is used (P2P)
-
-### ETH status handshake
-
-The ETH protocol status message includes a `forkid: ForkId` field.
-
-- Type: `reth_eth_wire_types::Status` / `UnifiedStatus`.
-- Purpose: the initial compatibility check during peer handshake.
-
-Code: `crates/net/eth-wire-types/src/status.rs`
-
-### Session fork-id validation
-
-`reth_network` maintains a `ForkFilter` inside `SessionManager`.
-
-- `SessionManager::is_valid_fork_id(fork_id)` validates the remote peer fork id according to
-  EIP-2124 rules.
-- When local status updates advance the head, `fork_filter.set_head(head)` may update the current
-  fork id and return a `ForkTransition`.
-
-Code: `crates/net/network/src/session/mod.rs`
-
-### Discovery ENR forkid advertisement
-
-Reth also uses fork ids in discovery via EIP-868 pairs stored in ENR.
-
-- The network layer updates the `eth` ENR key with `EnrForkIdEntry::from(fork_id)`.
-- Discv4/discv5 and DNS discovery can read or advertise forkid values.
-
-Code:
-
-- `crates/net/network/src/manager.rs` (adds EIP-868 `eth` pair)
-- `crates/net/network/src/discovery.rs` (updates forkid in local ENR)
-- `crates/net/discv4/src/lib.rs` and `crates/net/discv5/src/lib.rs` (ENR forkid decode/encode)
-
-## Practical implications / gotchas
-
-- Fork scheduling must be consistent across subsystems: the chainspec governs execution rules,
-  networking fork-id validation, and what fork ids are advertised in handshake/discovery.
-- Timestamp forks are only considered in fork-id hashing after the merge; Reth’s implementation
-  mirrors EIP-6122 behavior by processing block forks first and timestamp forks after.
-- `TTD` forks without a known block can’t participate in fork filtering by activation point.
-  Reth omits them from `ForkFilter` for that reason.
-
-## Related examples
-
-- Custom hardforks + wrappers implementing `Hardforks`/`EthChainSpec`:
-  `examples/custom-hardforks/src/chainspec.rs`
-- Custom node example shows wrapping an OP chainspec and delegating fork-id/filter methods:
-  `examples/custom-node/src/chainspec.rs`
+- `agent-docs/guides/custom-chainspec.md`
+- `crates/chainspec/src/spec.rs`
+- `crates/chainspec/src/api.rs`
+- `examples/custom-hardforks/src/chainspec.rs`

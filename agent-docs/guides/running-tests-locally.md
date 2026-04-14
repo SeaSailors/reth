@@ -1,203 +1,67 @@
 # Running Tests Locally
 
-This guide is a practical "how to" for running the same test layers CI runs, but locally and with tight iteration.
+Use the smallest test surface that proves the change, then escalate to the repo-wide gate before opening a PR.
 
-## Recommended Local Workflow
+## Fastest path
 
-1) Fast loop (package-level)
+1. Run the narrowest crate or test first.
+2. Run `make test-unit` for workspace unit-style coverage.
+3. If your change touches integration behavior, run the relevant crate `tests/` target or the full integration surface.
+4. Before sending a PR, run `make pr`.
 
-- Run only the crate you are changing:
+## Common commands
 
-```sh
-cargo nextest run -p <crate-name>
-```
+- Workspace unit-style tests: `make test-unit`
+- Full workspace nextest sweep: `cargo nextest run --workspace`
+- Doctests: `cargo test --doc --workspace --all-features`
+- Coverage for unit-style tests: `make cov-unit`
+- Full local pre-PR gate: `make pr`
 
-2) CI-parity loop (workspace)
+## Running a single crate or test
 
-- Run workspace tests via nextest:
+- Prefer package scoping: `cargo test -p <package> <test-name>`.
+- For direct `cargo test <name>` lookups, run from the target crate directory or use `-p`.
+- Match the surrounding crate's existing test style before adding new tests.
 
-```sh
-cargo nextest run --workspace
-```
+## When to run integration tests
 
-3) Pre-PR gate (what maintainers expect)
+Run integration coverage when the change affects cross-component behavior, networking, RPC surfaces, storage interactions, or node startup.
 
-- Run the repo's aggregated pre-PR target:
+Useful local paths:
 
-```sh
-make pr
-```
+- Crate `tests/` targets: `cargo nextest run -p <package> -E 'kind(test)'`
+- E2E testsuite binaries: `cargo nextest run -E 'binary(e2e_testsuite)'`
 
-This runs formatting, clippy, docs generation checks, and tests.
+## External requirements
 
-## Test Layers and How to Run Them
+- Some integration coverage requires Geth. CI installs it in `.github/workflows/integration.yml`; locally install Geth if you need the same surface.
+- EF / EEST protocol fixtures are not checked in by default. `make ef-tests` downloads them into `testing/ef-tests/` and runs the `ef-tests` package.
 
-### Unit tests (crate-local `src/`)
+## Determinism and flake handling
 
-- Most unit tests run when you run the package normally:
+- CI sets `SEED=rustethereumethereumrust`; use `SEED=<value>` locally when you need reproducible RNG-backed tests.
+- Nextest retry and slow-timeout behavior is defined in `.config/nextest.toml`.
 
-```sh
-cargo nextest run -p <crate-name>
-```
+## What `make pr` covers
 
-If you want to approximate the unit workflow partitioning CI uses, you can use nextest expressions, but the easiest local loop is usually package-scoped.
+`make pr` runs the broad local gate in this order:
 
-### Integration tests (`tests/`)
+1. `make lint`
+2. `make update-book-cli`
+3. `cargo docs --document-private-items`
+4. `make test`
 
-Run integration tests for a specific crate:
+Use it before opening or updating a PR when code changed.
 
-```sh
-cargo nextest run -p <crate-name> -E 'kind(test)'
-```
+## Retrieval map
 
-Notes:
-
-- Some integration coverage expects a reference client (CI installs Geth in `.github/workflows/integration.yml`). If you see failures that look like missing external tooling, install the required dependency locally.
-
-### E2E testsuite (testsuite framework)
-
-Run all e2e testsuite binaries across the workspace:
-
-```sh
-cargo nextest run --workspace -E 'binary(e2e_testsuite)'
-```
-
-Run e2e for a single crate:
-
-```sh
-cargo nextest run -p <crate-name> -E 'binary(e2e_testsuite)'
-```
-
-Run one e2e test by name:
-
-```sh
-cargo nextest run -p <crate-name> -E 'binary(e2e_testsuite) and test(<test_name_substring>)'
-```
-
-Important:
-
-- E2E tests are discovered by the test binary name, which must be `e2e_testsuite`.
-- Timeouts/retries are tuned in `.config/nextest.toml` for `binary(e2e_testsuite)`.
-
-### EF / EEST fixture tests
-
-The easiest local entry point is the Make target:
-
-```sh
-make ef-tests
-```
-
-What it does:
-
-- Downloads and unpacks EF legacy fixtures into `testing/ef-tests/ethereum-tests/`.
-- Downloads and unpacks EEST fixtures into `testing/ef-tests/execution-spec-tests/`.
-- Runs the `ef-tests` package using nextest.
-
-Run the harness directly (useful when iterating on the harness itself):
-
-```sh
-cargo nextest run -p ef-tests --release --features "asm-keccak ef-tests"
-```
-
-Run only EF GeneralStateTests (uses nextest expression selection):
-
-```sh
-cargo nextest run -p ef-tests --release --features "asm-keccak ef-tests" -E 'test(general_state_tests)'
-```
-
-Run only EEST fixtures:
-
-```sh
-cargo nextest run -p ef-tests --release --features "asm-keccak ef-tests" -E 'test(eest_fixtures)'
-```
-
-If you need to narrow further, filter by a specific test name:
-
-```sh
-cargo nextest run -p ef-tests --release --features "asm-keccak ef-tests" -E 'test(general_state_tests::shanghai)'
-```
-
-(Use `cargo nextest list -p ef-tests` to discover the exact test names on your machine.)
-
-### RPC e2e compatibility tests (execution-apis)
-
-The RPC e2e tests can run compatibility checks against the official `ethereum/execution-apis` test suite.
-
-Typical setup:
-
-- Clone `execution-apis` somewhere locally.
-- Point the tests at its `tests/` directory:
-
-```sh
-export EXECUTION_APIS_TEST_PATH=/abs/path/to/execution-apis/tests
-```
-
-Then run the relevant e2e test from the RPC e2e crate (example from that crate's README):
-
-```sh
-cargo nextest run --test e2e_testsuite test_execution_apis_compat
-```
-
-## Running Only a Subset (Most Useful Patterns)
-
-### 1) One package
-
-```sh
-cargo nextest run -p <crate-name>
-```
-
-### 2) One test target / binary
-
-```sh
-cargo nextest run -p <crate-name> --test <integration_test_target>
-```
-
-Or for e2e testsuite targets:
-
-```sh
-cargo nextest run -p <crate-name> -E 'binary(e2e_testsuite)'
-```
-
-### 3) One test by name
-
-```sh
-cargo nextest run -p <crate-name> -E 'test(<substring>)'
-```
-
-### 4) Use nextest expressions to combine constraints
-
-```sh
-cargo nextest run --workspace -E 'package(<crate-name>) and test(<substring>)'
-```
-
-### 5) Exclude slow/unrelated crates
-
-This is especially useful for e2e runs (CI uses this pattern):
-
-```sh
-cargo nextest run --workspace \
-  --exclude 'example-*' \
-  --exclude 'reth-bench' \
-  --exclude 'ef-tests' \
-  -E 'binary(e2e_testsuite)'
-```
-
-## Coverage
-
-Unit-test coverage is wired via `cargo llvm-cov` in `Makefile`:
-
-```sh
-make cov-unit
-```
-
-This produces `lcov.info` at the repo root.
-
-## Determinism
-
-If a test uses RNG and you want deterministic runs:
-
-```sh
-export SEED=rustethereumethereumrust
-```
-
-(This mirrors the fixed `SEED` used in CI workflows.)
+- `CONTRIBUTING.md:99`
+- `CONTRIBUTING.md:121`
+- `README.md:100`
+- `README.md:112`
+- `README.md:123`
+- `Makefile:158`
+- `Makefile:192`
+- `Makefile:339`
+- `.config/nextest.toml`
+- `.github/workflows/integration.yml`
