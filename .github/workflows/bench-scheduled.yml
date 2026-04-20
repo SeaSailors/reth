@@ -11,7 +11,7 @@
 # successful run saves the feature commit SHA so the next run knows what to
 # compare against.
 on:
-  schedule:
+  #schedule:
   # Nightly: compares previous vs current nightly Docker build
   #- cron: "30 5 * * *"
   # Hourly: compares main HEAD vs last benchmarked commit, skips if no new commits
